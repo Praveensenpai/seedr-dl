@@ -1,4 +1,4 @@
-use crate::config::{cache_dir, get_gemini_key, Config};
+use crate::config::{downloads_dir, get_gemini_key, Config};
 use crate::downloader::Downloader;
 use crate::gemini::{self, MediaInfo};
 use crate::seedr::{SeedrClient, SeedrFolder};
@@ -29,8 +29,8 @@ pub async fn download_and_ingest(
     }
 
     let gemini_key = get_gemini_key(cfg);
-    let downloader = Downloader::new();
-    let temp_dir = cache_dir();
+    let downloader = Downloader::new(cfg.download_threads);
+    let temp_dir = downloads_dir();
 
     for file in &contents.files {
         let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;

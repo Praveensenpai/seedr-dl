@@ -151,15 +151,15 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
 
     let footer_text = if task.status == TaskStatus::Completed || task.status == TaskStatus::Failed {
         Line::from(vec![
-            Span::styled(" [Enter] / [Esc] / [q] ", Style::default().fg(Color::Green).bold()),
+            Span::styled(
+                " [Enter] / [Esc] / [q] ",
+                Style::default().fg(Color::Green).bold(),
+            ),
             Span::raw("Return to Manager"),
         ])
     } else {
         Line::from(vec![
-            Span::styled(
-                " [d] / [Esc] ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
+            Span::styled(" [d] / [Esc] ", Style::default().fg(Color::Yellow).bold()),
             Span::raw("Detach (download continues in background)       "),
             Span::styled("[x] ", Style::default().fg(Color::Red).bold()),
             Span::raw("Cancel download"),

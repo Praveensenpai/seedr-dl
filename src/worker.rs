@@ -1,4 +1,5 @@
-use crate::config::{cache_dir, get_gemini_key, load_auth, load_config};
+use crate::config::{cache_dir, downloads_dir, get_gemini_key, load_auth, load_config};
+use crate::downloader::state::DownloadState;
 use crate::downloader::Downloader;
 use crate::gemini;
 use crate::organizer;
@@ -79,16 +80,14 @@ async fn run_worker_internal(folder_id: u64) -> Result<()> {
     let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;
     let pid = std::process::id();
 
-    let temp_dir = cache_dir().join("downloads");
+    let temp_dir = downloads_dir();
     let _ = fs::create_dir_all(&temp_dir);
-    let part_path = temp_dir.join(format!("{}.part", file.name));
-    let mut initial_dl = fs::metadata(&part_path).map_or(0, |m| m.len());
-    if initial_dl == 0 {
-        for i in 0..8 {
-            let p = temp_dir.join(format!("{}.part.{i}", file.name));
-            initial_dl += fs::metadata(&p).map_or(0, |m| m.len());
-        }
-    }
+    let state_path = DownloadState::state_path(&temp_dir, &file.name);
+    let initial_dl = if let Ok(content) = fs::read_to_string(&state_path) {
+        serde_json::from_str::<DownloadState>(&content).map_or(0, |s| s.total_downloaded())
+    } else {
+        0
+    };
 
     let task = Arc::new(Mutex::new(TaskState {
         folder_id,
@@ -108,7 +107,7 @@ async fn run_worker_internal(folder_id: u64) -> Result<()> {
     }
 
     let download_url = client.get_download_url(file_id).await?;
-    let downloader = Downloader::new();
+    let downloader = Downloader::new(cfg.download_threads);
 
     let task_cb = Arc::clone(&task);
     let downloaded_path = downloader

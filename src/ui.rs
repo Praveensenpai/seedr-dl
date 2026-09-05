@@ -188,8 +188,12 @@ fn render_folders(
                 let is_dl = tasks.iter().any(|t| t.folder_id == folder.id);
                 let prefix = if is_sel { " ❯ " } else { "   " };
                 let dl_tag = if is_dl { " ⚡ [DOWNLOADING]" } else { "" };
-                let content =
-                    format!("{prefix}[{}] 📁 {} ({} MB){dl_tag}", i + 1, folder.name, sz_mb);
+                let content = format!(
+                    "{prefix}[{}] 📁 {} ({} MB){dl_tag}",
+                    i + 1,
+                    folder.name,
+                    sz_mb
+                );
                 let style = if is_sel {
                     Style::default()
                         .bg(Color::Cyan)

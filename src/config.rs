@@ -3,12 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn default_download_threads() -> usize {
+    8
+}
+
 /// Application settings stored in ~/.config/seedr-dl/config.json
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub jellyfin_media_dir: PathBuf,
     pub gemini_api_key: Option<String>,
     pub delete_after_download: bool,
+    #[serde(default = "default_download_threads")]
+    pub download_threads: usize,
 }
 
 impl Default for Config {
@@ -18,6 +24,7 @@ impl Default for Config {
             jellyfin_media_dir: Path::new(&home).join("jellyfin/media"),
             gemini_api_key: None,
             delete_after_download: false,
+            download_threads: default_download_threads(),
         }
     }
 }
@@ -29,14 +36,21 @@ pub struct Auth {
     pub refresh_token: Option<String>,
 }
 
+/// Returns application config directory (~/.config/seedr-dl).
 pub fn config_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     Path::new(&home).join(".config/seedr-dl")
 }
 
+/// Returns base application cache directory (~/.cache/seedr-dl).
 pub fn cache_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    Path::new(&home).join(".cache/seedr-dl/downloads")
+    Path::new(&home).join(".cache/seedr-dl")
+}
+
+/// Returns downloads cache directory (~/.cache/seedr-dl/downloads).
+pub fn downloads_dir() -> PathBuf {
+    cache_dir().join("downloads")
 }
 
 pub fn load_config() -> Result<Config> {

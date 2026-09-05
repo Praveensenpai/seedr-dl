@@ -1,45 +1,71 @@
+//! Multi-threaded downloader with range support, single-file offset streaming, and resume.
+
+pub mod chunk;
+pub mod coordinator;
+pub mod single;
+pub mod state;
+
+use self::chunk::{download_chunk_with_retry, ChunkJob};
+use self::coordinator::{spawn_coordinator, CoordinatorConfig};
+use self::single::download_single;
+use self::state::{cleanup_legacy_parts, ChunkRange, DownloadState};
 use anyhow::{Context, Result};
 use colored::Colorize;
-use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::RANGE;
 use reqwest::Client;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::fs::{self, OpenOptions};
+use tokio::sync::Mutex;
 
-const THREADS: u64 = 8;
-
+/// Progress callback receiving (`downloaded_bytes`, `total_bytes`, `speed_bps`, `eta_seconds`).
 pub type ProgressCallback = Arc<dyn Fn(u64, u64, u64, u64) + Send + Sync>;
 
+/// Downloader supporting chunked concurrent downloads and atomic resumes.
 pub struct Downloader {
     client: Client,
+    num_threads: usize,
 }
 
 impl Default for Downloader {
     fn default() -> Self {
-        Self::new()
+        Self::new(8)
     }
 }
 
+/// Specifications for a download task.
+pub struct DownloadTarget<'a> {
+    pub url: &'a str,
+    pub target_dir: &'a Path,
+    pub file_name: &'a str,
+    pub total_size: u64,
+}
+
 impl Downloader {
-    pub fn new() -> Self {
+    /// Creates a new Downloader with the configured thread count.
+    #[must_use]
+    pub fn new(threads: usize) -> Self {
         let seedr_addr = SocketAddr::from(([95, 211, 204, 172], 443));
+        let client = Client::builder()
+            .resolve("www.seedr.cc", seedr_addr)
+            .resolve("seedr.cc", seedr_addr)
+            .resolve("stream.seedr.cc", seedr_addr)
+            .resolve("direct.seedr.cc", seedr_addr)
+            .timeout(Duration::from_hours(1))
+            .build()
+            .unwrap_or_default();
+
         Self {
-            client: Client::builder()
-                .resolve("www.seedr.cc", seedr_addr)
-                .resolve("seedr.cc", seedr_addr)
-                .resolve("stream.seedr.cc", seedr_addr)
-                .resolve("direct.seedr.cc", seedr_addr)
-                .timeout(Duration::from_hours(1))
-                .build()
-                .unwrap_or_default(),
+            client,
+            num_threads: threads.max(1),
         }
     }
 
+    /// Downloads file displaying a CLI progress bar.
     pub async fn download(&self, url: &str, target_dir: &Path, file_name: &str) -> Result<PathBuf> {
         let (total_size, _) = self.probe_download(url).await?;
         let pb = create_progress_bar(total_size, file_name)?;
@@ -66,6 +92,7 @@ impl Downloader {
         }
     }
 
+    /// Downloads file streaming progress to the supplied callback.
     pub async fn download_with_callback<F>(
         &self,
         url: &str,
@@ -78,30 +105,21 @@ impl Downloader {
     {
         let (total_size, supports_range) = self.probe_download(url).await?;
         let cb: ProgressCallback = Arc::new(callback);
+        let target = DownloadTarget {
+            url,
+            target_dir,
+            file_name,
+            total_size,
+        };
 
         if supports_range && total_size >= 5 * 1024 * 1024 {
-            match self
-                .download_parallel(url, target_dir, file_name, Arc::clone(&cb), total_size)
-                .await
-            {
-                Ok(path) => Ok(path),
-                Err(e) => {
-                    eprintln!(
-                        "  {} Parallel download failed ({e:#}), falling back to single stream...",
-                        "•".yellow()
-                    );
-                    self.download_single(url, target_dir, file_name, cb, total_size)
-                        .await
-                }
-            }
+            self.download_parallel(&target, cb).await
         } else {
-            self.download_single(url, target_dir, file_name, cb, total_size)
-                .await
+            download_single(&self.client, &target, cb).await
         }
     }
 
     async fn probe_download(&self, url: &str) -> Result<(u64, bool)> {
-        // Use GET with Range: bytes=0-0 instead of HEAD to avoid 405/403 or connection reset
         let res = self
             .client
             .get(url)
@@ -130,290 +148,133 @@ impl Downloader {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    async fn download_parallel(
-        &self,
-        url: &str,
-        target_dir: &Path,
-        file_name: &str,
-        callback: ProgressCallback,
-        total_size: u64,
-    ) -> Result<PathBuf> {
-        fs::create_dir_all(target_dir).await?;
-        let final_path = target_dir.join(file_name);
-        if fs::metadata(&final_path).await.map_or(0, |m| m.len()) == total_size && total_size > 0 {
-            return Ok(final_path);
-        }
+    async fn prepare_parallel_file(target: &DownloadTarget<'_>) -> Result<()> {
+        fs::create_dir_all(target.target_dir).await?;
+        cleanup_legacy_parts(target.target_dir, target.file_name).await;
 
-        let chunk_size = total_size.div_ceil(THREADS);
-        let downloaded = Arc::new(Mutex::new(0u64));
-        let start_time = Instant::now();
-        let last_cb = Arc::new(Mutex::new(Instant::now()));
-        let last_bytes = Arc::new(Mutex::new(0u64));
-
-        let mut initial_total: u64 = 0;
-        for i in 0..THREADS {
-            let chunk_start = i * chunk_size;
-            if chunk_start >= total_size {
-                break;
-            }
-            let chunk_end = ((i + 1) * chunk_size).min(total_size) - 1;
-            let chunk_len = chunk_end - chunk_start + 1;
-            let part_path = target_dir.join(format!("{file_name}.part.{i}"));
-            let done = fs::metadata(&part_path).await.map_or(0, |m| m.len()).min(chunk_len);
-            initial_total += done;
-        }
-
-        if let Ok(mut d) = downloaded.lock() {
-            *d = initial_total;
-        }
-        if let Ok(mut b) = last_bytes.lock() {
-            *b = initial_total;
-        }
-
-        #[allow(clippy::cast_possible_truncation)]
-        let mut handles = Vec::with_capacity(THREADS as usize);
-        for i in 0..THREADS {
-            let chunk_start = i * chunk_size;
-            if chunk_start >= total_size {
-                break;
-            }
-            let chunk_end = ((i + 1) * chunk_size).min(total_size) - 1;
-            let chunk_len = chunk_end - chunk_start + 1;
-            let part_path = target_dir.join(format!("{file_name}.part.{i}"));
-            let done = fs::metadata(&part_path).await.map_or(0, |m| m.len()).min(chunk_len);
-
-            if done >= chunk_len {
-                continue; // chunk already completely downloaded
-            }
-
-            let client = self.client.clone();
-            let url = url.to_string();
-            let downloaded = Arc::clone(&downloaded);
-            let last_cb = Arc::clone(&last_cb);
-            let last_bytes = Arc::clone(&last_bytes);
-            let cb = Arc::clone(&callback);
-
-            let resume_from = chunk_start + done;
-
-            let handle = tokio::spawn(async move {
-                download_chunk_to_part(
-                    &client,
-                    &url,
-                    &part_path,
-                    resume_from,
-                    chunk_end,
-                    chunk_len,
-                    done,
-                    total_size,
-                    downloaded,
-                    last_cb,
-                    last_bytes,
-                    cb,
-                )
-                .await
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.await.context("Chunk task panicked")??;
-        }
-
-        // Assemble all part files safely
-        let assemble_tmp = target_dir.join(format!("{file_name}.assembling"));
-        let mut out_file = File::create(&assemble_tmp).await?;
-
-        for i in 0..THREADS {
-            let chunk_start = i * chunk_size;
-            if chunk_start >= total_size {
-                break;
-            }
-            let part_path = target_dir.join(format!("{file_name}.part.{i}"));
-            let mut part_file = File::open(&part_path).await?;
-            tokio::io::copy(&mut part_file, &mut out_file).await?;
-            drop(part_file);
-            let _ = fs::remove_file(part_path).await;
-        }
-
-        out_file.flush().await?;
-        drop(out_file);
-
-        fs::rename(&assemble_tmp, &final_path).await?;
-
-        let elapsed = start_time.elapsed().as_secs().max(1);
-        let avg_spd = total_size.checked_div(elapsed).unwrap_or(0);
-        callback(total_size, total_size, avg_spd, 0);
-
-        Ok(final_path)
+        let part_path = DownloadState::part_path(target.target_dir, target.file_name);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&part_path)
+            .await
+            .context("Failed to open part file for preallocation")?;
+        file.set_len(target.total_size)
+            .await
+            .context("Failed to preallocate part file")?;
+        Ok(())
     }
 
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    async fn download_single(
+    async fn download_parallel(
         &self,
-        url: &str,
-        target_dir: &Path,
-        file_name: &str,
+        target: &DownloadTarget<'_>,
         callback: ProgressCallback,
-        total_size: u64,
     ) -> Result<PathBuf> {
-        fs::create_dir_all(target_dir).await?;
-        let final_path = target_dir.join(file_name);
-        let temp_path = target_dir.join(format!("{file_name}.part"));
+        Self::prepare_parallel_file(target).await?;
+        let state = DownloadState::load_or_init(
+            target.target_dir,
+            target.file_name,
+            target.total_size,
+            self.num_threads,
+        )
+        .await?;
 
-        let existing = fs::metadata(&temp_path).await.map_or(0, |m| m.len());
-        if existing >= total_size && total_size > 0 {
-            fs::rename(&temp_path, &final_path).await?;
-            callback(total_size, total_size, 0, 0);
-            return Ok(final_path);
+        if state.chunks.iter().all(ChunkRange::is_complete) {
+            callback(target.total_size, target.total_size, 0, 0);
+            return finish_download(target).await;
         }
 
-        let mut req = self.client.get(url);
-        if existing > 0 {
-            req = req.header(RANGE, format!("bytes={existing}-"));
+        let state_arc = Arc::new(Mutex::new(state));
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let failed_flag = Arc::new(AtomicBool::new(false));
+
+        let coord = spawn_coordinator(CoordinatorConfig {
+            state: Arc::clone(&state_arc),
+            target_dir: target.target_dir.to_path_buf(),
+            file_name: target.file_name.to_string(),
+            total_size: target.total_size,
+            callback: Arc::clone(&callback),
+            done_flag: Arc::clone(&done_flag),
+        });
+
+        let handles = spawn_chunk_jobs(&self.client, target, &state_arc, &failed_flag).await;
+        let chunk_err = wait_for_chunks(handles).await;
+
+        done_flag.store(true, Ordering::Relaxed);
+        let _ = coord.await;
+
+        if let Some(err) = chunk_err {
+            let s = state_arc.lock().await;
+            let _ = s.save(target.target_dir, target.file_name).await;
+            return Err(err);
         }
 
-        let res = req.send().await.context("Failed to connect to stream")?;
-        let status = res.status();
-        if !status.is_success() {
-            anyhow::bail!("Server returned error on stream: {status}");
-        }
-
-        let (mut file, mut downloaded, eff_total) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            let total = if total_size > 0 {
-                total_size
-            } else {
-                existing + res.content_length().unwrap_or(0)
-            };
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&temp_path)
-                .await?;
-            (f, existing, total)
-        } else {
-            let total = if total_size > 0 {
-                total_size
-            } else {
-                res.content_length().unwrap_or(0)
-            };
-            let f = File::create(&temp_path).await?;
-            (f, 0, total)
-        };
-
-        let mut stream = res.bytes_stream();
-        let start_time = Instant::now();
-        let mut last_cb = Instant::now();
-        let mut last_bytes = downloaded;
-
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = chunk_res.context("Network error during streaming")?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-
-            if last_cb.elapsed() >= Duration::from_millis(400) {
-                let dur = last_cb.elapsed().as_secs_f64();
-                let speed = if dur > 0.0 {
-                    ((downloaded.saturating_sub(last_bytes)) as f64 / dur) as u64
-                } else {
-                    0
-                };
-                let rem = eff_total.saturating_sub(downloaded);
-                let eta = rem.checked_div(speed).unwrap_or(0);
-                callback(downloaded, eff_total, speed, eta);
-                last_cb = Instant::now();
-                last_bytes = downloaded;
-            }
-        }
-
-        file.flush().await?;
-        drop(file);
-
-        fs::rename(&temp_path, &final_path).await?;
-
-        let elapsed = start_time.elapsed().as_secs().max(1);
-        let avg_spd = eff_total.checked_div(elapsed).unwrap_or(0);
-        callback(eff_total, eff_total, avg_spd, 0);
-
-        Ok(final_path)
+        callback(target.total_size, target.total_size, 0, 0);
+        finish_download(target).await
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-async fn download_chunk_to_part(
+async fn spawn_chunk_jobs(
     client: &Client,
-    url: &str,
-    part_path: &Path,
-    resume_from: u64,
-    chunk_end: u64,
-    chunk_len: u64,
-    already_done: u64,
-    total_size: u64,
-    downloaded: Arc<Mutex<u64>>,
-    last_cb: Arc<Mutex<Instant>>,
-    last_bytes: Arc<Mutex<u64>>,
-    callback: ProgressCallback,
-) -> Result<()> {
-    let range = format!("bytes={resume_from}-{chunk_end}");
-    let res = client
-        .get(url)
-        .header(RANGE, &range)
-        .send()
-        .await
-        .context("Chunk request failed")?;
+    target: &DownloadTarget<'_>,
+    state_arc: &Arc<Mutex<DownloadState>>,
+    failed_flag: &Arc<AtomicBool>,
+) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+    let part_path = DownloadState::part_path(target.target_dir, target.file_name);
+    let chunks_to_run = {
+        let s = state_arc.lock().await;
+        s.chunks.clone()
+    };
 
-    let status = res.status();
-    if !status.is_success() {
-        anyhow::bail!("Server returned error for chunk range {range}: {status}");
-    }
-
-    let mut part_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(part_path)
-        .await?;
-
-    let mut stream = res.bytes_stream();
-    let mut chunk_downloaded = already_done;
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.context("Network error in chunk stream")?;
-        let len = chunk.len() as u64;
-
-        part_file.write_all(&chunk).await?;
-        chunk_downloaded += len;
-
-        if let Ok(mut d) = downloaded.lock() {
-            *d += len;
+    let mut handles = Vec::new();
+    for chunk in chunks_to_run {
+        if chunk.is_complete() {
+            continue;
         }
+        let job = ChunkJob {
+            client: client.clone(),
+            url: target.url.to_string(),
+            part_path: part_path.clone(),
+            chunk_index: chunk.index,
+        };
+        let s_clone = Arc::clone(state_arc);
+        let f_clone = Arc::clone(failed_flag);
+        handles.push(tokio::spawn(async move {
+            download_chunk_with_retry(job, s_clone, f_clone).await
+        }));
+    }
+    handles
+}
 
-        if let Ok(mut t) = last_cb.lock() {
-            if t.elapsed() >= Duration::from_millis(400) {
-                let dur = t.elapsed().as_secs_f64();
-                let total_dl = downloaded.lock().map_or(0, |d| *d);
-                let last = last_bytes.lock().map_or(0, |b| *b);
-                let speed = if dur > 0.0 {
-                    ((total_dl.saturating_sub(last)) as f64 / dur) as u64
-                } else {
-                    0
-                };
-                let rem = total_size.saturating_sub(total_dl);
-                let eta = rem.checked_div(speed).unwrap_or(0);
-                callback(total_dl, total_size, speed, eta);
-                *t = Instant::now();
-                if let Ok(mut b) = last_bytes.lock() {
-                    *b = total_dl;
+async fn wait_for_chunks(
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+) -> Option<anyhow::Error> {
+    let mut chunk_err = None;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if chunk_err.is_none() {
+                    chunk_err = Some(e);
+                }
+            }
+            Err(e) => {
+                if chunk_err.is_none() {
+                    chunk_err = Some(anyhow::anyhow!("Task join error: {e}"));
                 }
             }
         }
-
-        if chunk_downloaded >= chunk_len {
-            break;
-        }
     }
+    chunk_err
+}
 
-    part_file.flush().await?;
-    Ok(())
+async fn finish_download(target: &DownloadTarget<'_>) -> Result<PathBuf> {
+    let part_path = DownloadState::part_path(target.target_dir, target.file_name);
+    let final_path = target.target_dir.join(target.file_name);
+    fs::rename(&part_path, &final_path).await?;
+    DownloadState::cleanup(target.target_dir, target.file_name).await;
+    Ok(final_path)
 }
 
 fn create_progress_bar(total_size: u64, file_name: &str) -> Result<ProgressBar> {
@@ -446,45 +307,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chunk_partitioning_exact() {
-        let total_size = 100_000_000u64;
-        let chunk_size = total_size.div_ceil(THREADS);
-        let mut covered = 0;
-
-        for i in 0..THREADS {
-            let chunk_start = i * chunk_size;
-            if chunk_start >= total_size {
-                break;
-            }
-            let chunk_end = ((i + 1) * chunk_size).min(total_size) - 1;
-            let chunk_len = chunk_end - chunk_start + 1;
-            assert_eq!(chunk_start, covered);
-            covered += chunk_len;
-        }
-        assert_eq!(covered, total_size);
-    }
-
-    #[test]
-    fn test_chunk_partitioning_small_file() {
-        for total_size in [1u64, 2, 7, 8, 9, 15] {
-            let chunk_size = total_size.div_ceil(THREADS);
-            let mut covered = 0;
-
-            for i in 0..THREADS {
-                let chunk_start = i * chunk_size;
-                if chunk_start >= total_size {
-                    break;
-                }
-                let chunk_end = ((i + 1) * chunk_size).min(total_size) - 1;
-                let chunk_len = chunk_end - chunk_start + 1;
-                assert_eq!(chunk_start, covered);
-                covered += chunk_len;
-            }
-            assert_eq!(covered, total_size);
-        }
-    }
-
-    #[test]
     fn test_content_range_header_parsing() {
         let header = "bytes 0-0/987654321";
         let total = header
@@ -493,5 +315,10 @@ mod tests {
             .and_then(|s| s.trim().parse::<u64>().ok());
         assert_eq!(total, Some(987_654_321));
     }
-}
 
+    #[test]
+    fn test_downloader_thread_default() {
+        let d = Downloader::default();
+        assert_eq!(d.num_threads, 8);
+    }
+}

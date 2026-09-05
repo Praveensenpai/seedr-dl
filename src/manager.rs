@@ -123,7 +123,8 @@ async fn handle_main_key(
             if let Some(folder) = state.list.folders.get(state.selected) {
                 let is_running = state.local_tasks.iter().any(|t| t.folder_id == folder.id);
                 if !is_running {
-                    if let Err(e) = spawn_worker(folder.id, &folder.name, folder.size.unwrap_or(0)) {
+                    if let Err(e) = spawn_worker(folder.id, &folder.name, folder.size.unwrap_or(0))
+                    {
                         state.status = Some((format!("Failed to start download: {e}"), true));
                         return Ok(false);
                     }
@@ -147,7 +148,10 @@ async fn handle_main_key(
                 state.local_tasks = list_active_tasks();
                 state.list = client.list_root().await?;
             } else {
-                state.status = Some(("No active downloads running to attach to.".to_string(), false));
+                state.status = Some((
+                    "No active downloads running to attach to.".to_string(),
+                    false,
+                ));
             }
         }
         KeyCode::Char('m' | '+') => {

@@ -98,7 +98,11 @@ Return strictly valid JSON with this schema:
     };
 
     let client = Client::new();
-    for model in ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-1.5-flash"] {
+    for model in [
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+    ] {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         );
