@@ -88,7 +88,7 @@ impl DownloadState {
         let part = Self::part_path(target_dir, file_name);
         if let Ok(content) = fs::read_to_string(&path).await {
             if let Ok(mut state) = serde_json::from_str::<Self>(&content) {
-                if state.total_size == total_size {
+                if state.total_size == total_size && state.chunks.len() == num_threads {
                     if !part.exists() {
                         for c in &mut state.chunks {
                             c.downloaded = 0;

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn default_download_threads() -> usize {
-    8
+    2
 }
 
 /// Application settings stored in ~/.config/seedr-dl/config.json

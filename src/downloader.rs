@@ -33,7 +33,7 @@ pub struct Downloader {
 
 impl Default for Downloader {
     fn default() -> Self {
-        Self::new(8)
+        Self::new(2)
     }
 }
 
@@ -228,9 +228,12 @@ async fn spawn_chunk_jobs(
     };
 
     let mut handles = Vec::new();
-    for chunk in chunks_to_run {
+    for (idx, chunk) in chunks_to_run.into_iter().enumerate() {
         if chunk.is_complete() {
             continue;
+        }
+        if idx > 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
         let job = ChunkJob {
             client: client.clone(),
@@ -255,7 +258,10 @@ async fn wait_for_chunks(
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                if chunk_err.is_none() {
+                let msg = e.to_string();
+                let is_abort =
+                    msg.contains("Download aborted") || msg.contains("Download cancelled");
+                if chunk_err.is_none() || !is_abort {
                     chunk_err = Some(e);
                 }
             }
@@ -319,6 +325,6 @@ mod tests {
     #[test]
     fn test_downloader_thread_default() {
         let d = Downloader::default();
-        assert_eq!(d.num_threads, 8);
+        assert_eq!(d.num_threads, 2);
     }
 }

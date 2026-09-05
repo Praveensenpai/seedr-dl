@@ -21,14 +21,14 @@ pub struct ChunkJob {
     pub chunk_index: usize,
 }
 
-/// Downloads a chunk with up to 3 retries and exponential backoff.
+/// Downloads a chunk with up to 5 retries and exponential backoff.
 pub async fn download_chunk_with_retry(
     job: ChunkJob,
     state: Arc<Mutex<DownloadState>>,
     failed_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut attempt = 0;
-    let max_attempts = 3;
+    let max_attempts = 5;
 
     loop {
         if failed_flag.load(Ordering::Relaxed) {
@@ -55,7 +55,12 @@ pub async fn download_chunk_with_retry(
                         job.chunk_index
                     ));
                 }
-                let backoff_secs = 1u64 << (attempt - 1);
+                let shift = (attempt - 1).min(5);
+                let backoff_secs = if e.to_string().contains("429") {
+                    2u64.saturating_mul(u64::try_from(attempt).unwrap_or(1))
+                } else {
+                    1u64 << shift
+                };
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
             }
         }
@@ -124,5 +129,14 @@ async fn stream_chunk(
     }
 
     file.flush().await.context("Failed to flush chunk writes")?;
+
+    let is_done = {
+        let s = state.lock().await;
+        s.chunks[job.chunk_index].is_complete()
+    };
+    if !is_done {
+        anyhow::bail!("Stream disconnected before chunk completed");
+    }
+
     Ok(())
 }
