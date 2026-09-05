@@ -248,9 +248,30 @@ impl SeedrClient {
 
     pub async fn delete_folder(&self, folder_id: u64) -> Result<()> {
         let delete_arr = format!("[{{\"type\":\"folder\",\"id\":{folder_id}}}]");
+        self.post_delete(&delete_arr).await
+    }
+
+    pub async fn delete_torrent(&self, torrent_id: u64) -> Result<()> {
+        let delete_arr = format!("[{{\"type\":\"torrent\",\"id\":{torrent_id}}}]");
+        self.post_delete(&delete_arr).await
+    }
+
+    pub async fn delete_all_folders(&self, folders: &[SeedrFolder]) -> Result<()> {
+        if folders.is_empty() {
+            return Ok(());
+        }
+        let items: Vec<String> = folders
+            .iter()
+            .map(|f| format!("{{\"type\":\"folder\",\"id\":{}}}", f.id))
+            .collect();
+        let delete_arr = format!("[{}]", items.join(","));
+        self.post_delete(&delete_arr).await
+    }
+
+    async fn post_delete(&self, delete_arr: &str) -> Result<()> {
         let params = [
             ("func", "delete"),
-            ("delete_arr", &delete_arr),
+            ("delete_arr", delete_arr),
             ("access_token", &self.token),
         ];
         self.client

@@ -1,16 +1,15 @@
 mod config;
 mod downloader;
 mod gemini;
+mod manager;
 mod organizer;
 mod seedr;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use config::{
-    cache_dir, get_gemini_key, load_auth, load_config, save_auth, save_config, Auth, Config,
-};
-use downloader::Downloader;
+use config::{load_auth, load_config, save_auth, save_config, Auth, Config};
+use manager::run_dashboard;
 use seedr::SeedrClient;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -18,8 +17,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "seedr-dl")]
 #[command(author = "Praveensenpai <pvnt20@gmail.com>")]
-#[command(version = "0.1.0")]
-#[command(about = "Pure Rust Seedr.cc downloader with Gemini AI renaming for Jellyfin")]
+#[command(version = "0.2.0")]
+#[command(about = "Seedr Cloud Manager with Gemini AI Ingestion for Jellyfin")]
 struct Cli {
     /// Magnet link or torrent URL to download
     #[arg(value_name = "MAGNET_OR_URL")]
@@ -39,6 +38,8 @@ enum Commands {
     Auth,
     /// List files and folders currently in your Seedr cloud
     List,
+    /// Clean all completed items from your Seedr cloud
+    Clean,
     /// Configure Jellyfin path or Gemini API key
     Config {
         /// Set Gemini API Key
@@ -62,7 +63,16 @@ async fn main() -> Result<()> {
         Some(Commands::Auth) => {
             handle_auth().await?;
         }
-        Some(Commands::List) => handle_list(&cfg, cli.yes).await?,
+        Some(Commands::List) => {
+            let client = get_authenticated_client().await?;
+            run_dashboard(&client, &cfg, true).await?;
+        }
+        Some(Commands::Clean) => {
+            let client = get_authenticated_client().await?;
+            let list = client.list_root().await?;
+            client.delete_all_folders(&list.folders).await?;
+            println!("  {} All completed cloud folders deleted.", "✔".green());
+        }
         Some(Commands::Config {
             gemini_key,
             media_dir,
@@ -71,10 +81,11 @@ async fn main() -> Result<()> {
             handle_config(&mut cfg, gemini_key, media_dir, show)?;
         }
         None => {
+            let client = get_authenticated_client().await?;
             if let Some(magnet) = cli.magnet {
-                handle_download_magnet(&cfg, &magnet, cli.yes).await?;
+                handle_direct_magnet(&client, &cfg, &magnet, cli.yes).await?;
             } else {
-                handle_list(&cfg, cli.yes).await?;
+                run_dashboard(&client, &cfg, cli.yes).await?;
             }
         }
     }
@@ -154,8 +165,12 @@ fn handle_config(
     Ok(())
 }
 
-async fn handle_download_magnet(cfg: &Config, magnet: &str, non_interactive: bool) -> Result<()> {
-    let client = get_authenticated_client().await?;
+async fn handle_direct_magnet(
+    client: &SeedrClient,
+    cfg: &Config,
+    magnet: &str,
+    non_interactive: bool,
+) -> Result<()> {
     println!("  {} Sending magnet link to Seedr cloud...", "•".cyan());
     let torrent_id = client.add_magnet(magnet).await?;
 
@@ -164,119 +179,5 @@ async fn handle_download_magnet(cfg: &Config, magnet: &str, non_interactive: boo
         .await?
         .context("Could not find completed folder in Seedr cloud")?;
 
-    download_and_organize_folder(&client, cfg, &folder, non_interactive).await
-}
-
-async fn handle_list(cfg: &Config, non_interactive: bool) -> Result<()> {
-    let client = get_authenticated_client().await?;
-    let list = client.list_root().await?;
-
-    println!();
-    if let (Some(used), Some(max)) = (list.space_used, list.space_max) {
-        let used_mb = used / 1_048_576;
-        let max_mb = max / 1_048_576;
-        let free_mb = max_mb.saturating_sub(used_mb);
-        println!(
-            "  {} Cloud Storage: {used_mb} MB / {max_mb} MB used ({free_mb} MB free)",
-            "•".cyan()
-        );
-    }
-
-    if list.folders.is_empty() && list.files.is_empty() {
-        println!("  {} No completed files in Seedr cloud.", "•".dimmed());
-        return Ok(());
-    }
-
-    if !list.torrents.is_empty() {
-        println!("  {}", "Active Seedr Caching:".yellow());
-        for t in &list.torrents {
-            let pct = t.progress.unwrap_or(0.0);
-            let sz = t.size.unwrap_or(0) / 1024 / 1024;
-            println!("  • ⏳ {} ({} MB, {:.1}%)", t.name, sz, pct);
-        }
-    }
-
-    for (idx, f) in list.folders.iter().enumerate() {
-        let sz = f.size.unwrap_or(0) / 1024 / 1024;
-        println!("  [{}] 📁 {} ({} MB)", idx + 1, f.name.bold(), sz);
-    }
-
-    print!("\nEnter item to download (or 'd 1' to delete, 0 to cancel): ");
-    io::stdout().flush()?;
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice)?;
-    let trimmed = choice.trim();
-
-    if let Some(rest) = trimmed
-        .strip_prefix("d ")
-        .or_else(|| trimmed.strip_prefix("rm "))
-    {
-        let idx: usize = rest.trim().parse().unwrap_or(0);
-        if idx > 0 && idx <= list.folders.len() {
-            let folder = &list.folders[idx - 1];
-            client.delete_folder(folder.id).await?;
-            println!(
-                "  {} Deleted '{}' from Seedr cloud.",
-                "✔".green(),
-                folder.name
-            );
-            return Ok(());
-        }
-    }
-
-    let num: usize = trimmed.parse().unwrap_or(0);
-    if num > 0 && num <= list.folders.len() {
-        let folder = &list.folders[num - 1];
-        download_and_organize_folder(&client, cfg, folder, non_interactive).await?;
-    }
-    Ok(())
-}
-
-async fn download_and_organize_folder(
-    client: &SeedrClient,
-    cfg: &Config,
-    folder: &seedr::SeedrFolder,
-    non_interactive: bool,
-) -> Result<()> {
-    let contents = client.list_folder(folder.id).await?;
-    let gemini_key = get_gemini_key(cfg);
-    let downloader = Downloader::new();
-    let temp_dir = cache_dir();
-
-    for file in &contents.files {
-        let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;
-        let sz_mb = file.size / 1024 / 1024;
-        println!(
-            "\n  {} Fetching download URL for: {} ({} MB)",
-            "•".cyan(),
-            file.name,
-            sz_mb
-        );
-        let download_url = client.get_download_url(file_id).await?;
-
-        let downloaded_path = downloader
-            .download(&download_url, &temp_dir, &file.name)
-            .await?;
-
-        println!("  {} Analyzing title with Gemini AI...", "•".cyan());
-        let info = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
-
-        organizer::organize_file(
-            &downloaded_path,
-            &info,
-            &cfg.jellyfin_media_dir,
-            non_interactive,
-        )?;
-    }
-
-    print!("  Delete item from Seedr cloud to free space? [y/N]: ");
-    io::stdout().flush()?;
-    let mut del_input = String::new();
-    io::stdin().read_line(&mut del_input)?;
-    if del_input.trim().eq_ignore_ascii_case("y") {
-        client.delete_folder(folder.id).await?;
-        println!("  {} Cloud item deleted.", "✔".green());
-    }
-
-    Ok(())
+    manager::download_and_ingest(client, cfg, &folder, non_interactive).await
 }
