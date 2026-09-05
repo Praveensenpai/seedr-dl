@@ -57,7 +57,7 @@ pub async fn run_worker(folder_id: u64) -> Result<()> {
             eprintln!("Worker failed for folder {folder_id}: {e:#}");
             if let Some(mut t) = crate::task::load_task(folder_id) {
                 t.status = TaskStatus::Failed;
-                t.error = Some(e.to_string());
+                t.error = Some(format!("{e:#}"));
                 let _ = save_task(&t);
             }
             Err(e)
@@ -82,7 +82,13 @@ async fn run_worker_internal(folder_id: u64) -> Result<()> {
     let temp_dir = cache_dir().join("downloads");
     let _ = fs::create_dir_all(&temp_dir);
     let part_path = temp_dir.join(format!("{}.part", file.name));
-    let initial_dl = fs::metadata(&part_path).map_or(0, |m| m.len());
+    let mut initial_dl = fs::metadata(&part_path).map_or(0, |m| m.len());
+    if initial_dl == 0 {
+        for i in 0..8 {
+            let p = temp_dir.join(format!("{}.part.{i}", file.name));
+            initial_dl += fs::metadata(&p).map_or(0, |m| m.len());
+        }
+    }
 
     let task = Arc::new(Mutex::new(TaskState {
         folder_id,
