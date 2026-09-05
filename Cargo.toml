@@ -1,6 +1,6 @@
 [package]
 name = "seedr-dl"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 authors = ["Praveensenpai <pvnt20@gmail.com>"]
 description = "Pure Rust Seedr.cc downloader with Gemini AI renaming for Jellyfin"

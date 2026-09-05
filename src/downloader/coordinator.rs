@@ -24,6 +24,7 @@ pub fn spawn_coordinator(cfg: CoordinatorConfig) -> tokio::task::JoinHandle<()> 
         let mut interval = tokio::time::interval(Duration::from_millis(400));
         let mut last_save = Instant::now();
         let mut last_tick = Instant::now();
+        let mut smoothed_speed: u64 = 0;
         let mut last_downloaded = {
             let s = cfg.state.lock().await;
             s.total_downloaded()
@@ -41,15 +42,22 @@ pub fn spawn_coordinator(cfg: CoordinatorConfig) -> tokio::task::JoinHandle<()> 
             };
 
             let elapsed_ms = u64::try_from(last_tick.elapsed().as_millis()).unwrap_or(1);
-            let speed = total_dl
+            let instant_speed = total_dl
                 .saturating_sub(last_downloaded)
                 .saturating_mul(1000)
                 .checked_div(elapsed_ms)
                 .unwrap_or(0);
-            let rem = cfg.total_size.saturating_sub(total_dl);
-            let eta = rem.checked_div(speed).unwrap_or(0);
 
-            (cfg.callback)(total_dl, cfg.total_size, speed, eta);
+            smoothed_speed = if smoothed_speed == 0 {
+                instant_speed
+            } else {
+                (smoothed_speed.saturating_mul(7) + instant_speed.saturating_mul(3)) / 10
+            };
+
+            let rem = cfg.total_size.saturating_sub(total_dl);
+            let eta = rem.checked_div(smoothed_speed).unwrap_or(0);
+
+            (cfg.callback)(total_dl, cfg.total_size, smoothed_speed, eta);
             last_downloaded = total_dl;
             last_tick = Instant::now();
 
