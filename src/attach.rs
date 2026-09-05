@@ -14,12 +14,22 @@ pub async fn run_attach_loop(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     folder_id: u64,
 ) -> Result<()> {
-    while let Some(task) = load_task(folder_id) {
+    let mut retries = 0;
+    loop {
+        let Some(task) = load_task(folder_id) else {
+            if retries < 15 {
+                retries += 1;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            break;
+        };
+
         let is_done = task.status == TaskStatus::Completed || task.status == TaskStatus::Failed;
         term.draw(|f| draw_attach_screen(f, &task))?;
 
         if is_done {
-            wait_for_dismiss(term)?;
+            wait_for_dismiss(term, folder_id)?;
             break;
         }
 
@@ -27,7 +37,7 @@ pub async fn run_attach_loop(
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
-                        KeyCode::Char('b' | 'd') | KeyCode::Esc => break,
+                        KeyCode::Char('d' | 'b') | KeyCode::Esc => break,
                         KeyCode::Char('x') => {
                             cancel_task(folder_id);
                             break;
@@ -41,19 +51,22 @@ pub async fn run_attach_loop(
     Ok(())
 }
 
-fn wait_for_dismiss(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn wait_for_dismiss(term: &mut Terminal<CrosstermBackend<Stdout>>, folder_id: u64) -> Result<()> {
     loop {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press
-                && matches!(
-                    key.code,
-                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'b')
-                )
-            {
-                break;
+        if event::poll(Duration::from_millis(250))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press
+                    && matches!(
+                        key.code,
+                        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'b' | 'd')
+                    )
+                {
+                    break;
+                }
             }
         }
     }
+    crate::task::remove_task(folder_id);
     term.clear()?;
     Ok(())
 }
@@ -108,6 +121,7 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
     let spd_mb = task.speed_bps as f64 / 1_048_576.0;
     let eta_m = task.eta_seconds / 60;
     let eta_s = task.eta_seconds % 60;
+    let err_msg = task.error.as_deref().unwrap_or("Ingestion failed");
     let status_str = match task.status {
         TaskStatus::Downloading => "Downloading from Seedr CDN...".cyan(),
         TaskStatus::Organizing => "Analyzing with Gemini AI & moving to Jellyfin..."
@@ -116,7 +130,7 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
         TaskStatus::Completed => "✔ Ingestion complete! File placed in Jellyfin."
             .green()
             .bold(),
-        TaskStatus::Failed => "✖ Ingestion failed.".red().bold(),
+        TaskStatus::Failed => format!("✖ Failed: {err_msg}").red().bold(),
     };
 
     let stats = Paragraph::new(vec![
@@ -135,18 +149,18 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
     );
     f.render_widget(stats, chunks[2]);
 
-    let footer_text = if task.status == TaskStatus::Completed {
+    let footer_text = if task.status == TaskStatus::Completed || task.status == TaskStatus::Failed {
         Line::from(vec![
-            Span::styled(" [Enter] / [q] ", Style::default().fg(Color::Green).bold()),
+            Span::styled(" [Enter] / [Esc] / [q] ", Style::default().fg(Color::Green).bold()),
             Span::raw("Return to Manager"),
         ])
     } else {
         Line::from(vec![
             Span::styled(
-                " [b] / [d] / [Esc] ",
+                " [d] / [Esc] ",
                 Style::default().fg(Color::Yellow).bold(),
             ),
-            Span::raw("DETACH to background (download continues!)       "),
+            Span::raw("Detach (download continues in background)       "),
             Span::styled("[x] ", Style::default().fg(Color::Red).bold()),
             Span::raw("Cancel download"),
         ])

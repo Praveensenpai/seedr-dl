@@ -5,22 +5,67 @@ use crate::organizer;
 use crate::seedr::SeedrClient;
 use crate::task::{remove_task, save_task, TaskState, TaskStatus};
 use anyhow::{Context, Result};
+use std::fs::{self, OpenOptions};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-pub fn spawn_worker(folder_id: u64) -> Result<()> {
+pub fn spawn_worker(folder_id: u64, folder_name: &str, file_size: u64) -> Result<()> {
     let exe = std::env::current_exe().context("Could not get current executable")?;
-    Command::new(exe)
-        .args(["__worker", &folder_id.to_string()])
+    let log_dir = cache_dir().join("logs");
+    let _ = fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!("{folder_id}.log"));
+    let log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .context("Failed to open log file")?;
+
+    let stdout_stdio = log_file
+        .try_clone()
+        .map_or_else(|_| Stdio::null(), Stdio::from);
+
+    let child = Command::new(exe)
+        .args(["worker", &folder_id.to_string()])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(stdout_stdio)
+        .stderr(Stdio::from(log_file))
         .spawn()
         .context("Failed to spawn background download worker")?;
+
+    let task = TaskState {
+        folder_id,
+        pid: child.id(),
+        folder_name: folder_name.to_string(),
+        file_name: folder_name.to_string(),
+        downloaded_bytes: 0,
+        total_bytes: file_size,
+        speed_bps: 0,
+        eta_seconds: 0,
+        status: TaskStatus::Downloading,
+        error: None,
+    };
+    save_task(&task)?;
     Ok(())
 }
 
 pub async fn run_worker(folder_id: u64) -> Result<()> {
+    match run_worker_internal(folder_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("Worker failed for folder {folder_id}: {e:#}");
+            if let Some(mut t) = crate::task::load_task(folder_id) {
+                t.status = TaskStatus::Failed;
+                t.error = Some(e.to_string());
+                let _ = save_task(&t);
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn run_worker_internal(folder_id: u64) -> Result<()> {
     let cfg = load_config()?;
     let auth = load_auth()?.context("No auth found. Please run 'seedr-dl auth'")?;
     let client = SeedrClient::new(auth.access_token);
@@ -34,12 +79,17 @@ pub async fn run_worker(folder_id: u64) -> Result<()> {
     let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;
     let pid = std::process::id();
 
+    let temp_dir = cache_dir().join("downloads");
+    let _ = fs::create_dir_all(&temp_dir);
+    let part_path = temp_dir.join(format!("{}.part", file.name));
+    let initial_dl = fs::metadata(&part_path).map_or(0, |m| m.len());
+
     let task = Arc::new(Mutex::new(TaskState {
         folder_id,
         pid,
         folder_name: file.name.clone(),
         file_name: file.name.clone(),
-        downloaded_bytes: 0,
+        downloaded_bytes: initial_dl,
         total_bytes: file.size,
         speed_bps: 0,
         eta_seconds: 0,
@@ -53,7 +103,6 @@ pub async fn run_worker(folder_id: u64) -> Result<()> {
 
     let download_url = client.get_download_url(file_id).await?;
     let downloader = Downloader::new();
-    let temp_dir = cache_dir();
 
     let task_cb = Arc::clone(&task);
     let downloaded_path = downloader
@@ -83,7 +132,13 @@ pub async fn run_worker(folder_id: u64) -> Result<()> {
 
     organizer::organize_file(&downloaded_path, &info, &cfg.jellyfin_media_dir, true)?;
 
+    if let Ok(mut t) = task.lock() {
+        t.status = TaskStatus::Completed;
+        let _ = save_task(&t);
+    }
+
     let _ = client.delete_folder(folder_id).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     remove_task(folder_id);
 
     Ok(())

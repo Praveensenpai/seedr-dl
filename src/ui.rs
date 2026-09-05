@@ -59,7 +59,13 @@ pub fn draw_ui(f: &mut Frame, state: &AppState) {
         idx += 1;
     }
 
-    render_folders(f, chunks[idx], &state.list.folders, state.selected);
+    render_folders(
+        f,
+        chunks[idx],
+        &state.list.folders,
+        &state.local_tasks,
+        state.selected,
+    );
     idx += 1;
 
     render_footer(f, chunks[idx], state.status.as_ref());
@@ -163,7 +169,13 @@ fn render_local_tasks(f: &mut Frame, area: Rect, tasks: &[TaskState]) {
     f.render_widget(list, area);
 }
 
-fn render_folders(f: &mut Frame, area: Rect, folders: &[SeedrFolder], selected: usize) {
+fn render_folders(
+    f: &mut Frame,
+    area: Rect,
+    folders: &[SeedrFolder],
+    tasks: &[TaskState],
+    selected: usize,
+) {
     let items: Vec<ListItem> = if folders.is_empty() {
         vec![ListItem::new("  (no completed files in cloud)").style(Style::default().dim())]
     } else {
@@ -173,13 +185,18 @@ fn render_folders(f: &mut Frame, area: Rect, folders: &[SeedrFolder], selected: 
             .map(|(i, folder)| {
                 let sz_mb = folder.size.unwrap_or(0) / 1_048_576;
                 let is_sel = i == selected;
+                let is_dl = tasks.iter().any(|t| t.folder_id == folder.id);
                 let prefix = if is_sel { " ❯ " } else { "   " };
-                let content = format!("{prefix}[{}] 📁 {} ({} MB)", i + 1, folder.name, sz_mb);
+                let dl_tag = if is_dl { " ⚡ [DOWNLOADING]" } else { "" };
+                let content =
+                    format!("{prefix}[{}] 📁 {} ({} MB){dl_tag}", i + 1, folder.name, sz_mb);
                 let style = if is_sel {
                     Style::default()
                         .bg(Color::Cyan)
                         .fg(Color::Black)
                         .add_modifier(Modifier::BOLD)
+                } else if is_dl {
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -217,15 +234,15 @@ fn render_footer(f: &mut Frame, area: Rect, status: Option<&(String, bool)>) {
             Span::styled(" [↑/↓] ", Style::default().fg(Color::Cyan).bold()),
             Span::raw("Select   "),
             Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
-            Span::raw("Download & Attach   "),
-            Span::styled("[b] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Background   "),
-            Span::styled("[a] ", Style::default().fg(Color::Green).bold()),
+            Span::raw("Download / Attach   "),
+            Span::styled("[a] ", Style::default().fg(Color::Yellow).bold()),
             Span::raw("Attach   "),
             Span::styled("[m] ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("Add   "),
+            Span::raw("Add Magnet   "),
             Span::styled("[d] ", Style::default().fg(Color::Red).bold()),
             Span::raw("Delete   "),
+            Span::styled("[r] ", Style::default().fg(Color::White).bold()),
+            Span::raw("Refresh   "),
             Span::styled("[q] ", Style::default().dim().bold()),
             Span::raw("Quit"),
         ])

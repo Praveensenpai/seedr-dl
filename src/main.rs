@@ -23,7 +23,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "seedr-dl")]
 #[command(author = "Praveensenpai <pvnt20@gmail.com>")]
-#[command(version = "0.3.0")]
+#[command(version)]
 #[command(about = "Seedr Cloud Manager with Gemini AI Ingestion for Jellyfin")]
 struct Cli {
     /// Magnet link or torrent URL to download

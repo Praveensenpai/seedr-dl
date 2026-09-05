@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::modal::Modal;
-use crate::organizer::download_and_ingest;
 use crate::seedr::{SeedrClient, SeedrFolder, SeedrTorrent};
 use crate::ui::AppState;
 use crate::worker::spawn_worker;
@@ -13,7 +12,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdout};
 
 pub async fn handle_modal_key(
     state: &mut AppState,
@@ -116,7 +115,7 @@ async fn handle_magnet_input(
 
 async fn execute_add_magnet(
     client: &SeedrClient,
-    cfg: &Config,
+    _cfg: &Config,
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     magnet: &str,
 ) -> Result<()> {
@@ -124,19 +123,11 @@ async fn execute_add_magnet(
     println!("  {} Sending magnet to Seedr cloud...", "•".cyan());
     let id = client.add_magnet(magnet).await?;
     let folder = client.wait_for_caching(id, "Torrent").await?;
-    if let Some(f) = folder {
-        print!("  Download now? [b: background / f: foreground / n: skip]: ");
-        io::stdout().flush()?;
-        let mut ans = String::new();
-        io::stdin().read_line(&mut ans)?;
-        let t = ans.trim().to_lowercase();
-        if t == "b" || t == "1" {
-            spawn_worker(f.id)?;
-        } else if t.is_empty() || t == "f" || t == "y" {
-            download_and_ingest(client, cfg, &f, false).await?;
-        }
-    }
     resume_tui(term)?;
+    if let Some(f) = folder {
+        spawn_worker(f.id, &f.name, f.size.unwrap_or(0))?;
+        crate::attach::run_attach_loop(term, f.id).await?;
+    }
     Ok(())
 }
 

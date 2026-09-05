@@ -121,28 +121,33 @@ async fn handle_main_key(
         }
         KeyCode::Enter => {
             if let Some(folder) = state.list.folders.get(state.selected) {
-                spawn_worker(folder.id)?;
+                let is_running = state.local_tasks.iter().any(|t| t.folder_id == folder.id);
+                if !is_running {
+                    if let Err(e) = spawn_worker(folder.id, &folder.name, folder.size.unwrap_or(0)) {
+                        state.status = Some((format!("Failed to start download: {e}"), true));
+                        return Ok(false);
+                    }
+                }
                 run_attach_loop(term, folder.id).await?;
                 state.local_tasks = list_active_tasks();
                 state.list = client.list_root().await?;
             }
         }
-        KeyCode::Char('b') => {
-            if let Some(folder) = state.list.folders.get(state.selected) {
-                spawn_worker(folder.id)?;
-                state.local_tasks = list_active_tasks();
-                state.status = Some((
-                    format!("Started background download for '{}'", folder.name),
-                    false,
-                ));
-            }
-        }
         KeyCode::Char('a' | 'A') => {
-            if let Some(first_task) = state.local_tasks.first() {
-                run_attach_loop(term, first_task.folder_id).await?;
+            let target_id = state
+                .list
+                .folders
+                .get(state.selected)
+                .map(|f| f.id)
+                .filter(|id| state.local_tasks.iter().any(|t| t.folder_id == *id))
+                .or_else(|| state.local_tasks.first().map(|t| t.folder_id));
+
+            if let Some(fid) = target_id {
+                run_attach_loop(term, fid).await?;
                 state.local_tasks = list_active_tasks();
+                state.list = client.list_root().await?;
             } else {
-                state.modal = Some(Modal::InputMagnet(String::new()));
+                state.status = Some(("No active downloads running to attach to.".to_string(), false));
             }
         }
         KeyCode::Char('m' | '+') => {
