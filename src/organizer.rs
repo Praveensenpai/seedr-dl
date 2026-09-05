@@ -1,12 +1,23 @@
 use crate::config::{downloads_dir, get_gemini_key, Config};
 use crate::downloader::Downloader;
 use crate::gemini::{self, MediaInfo};
+use crate::history::{self, HistoryEntry, RenameStatus};
 use crate::seedr::{SeedrClient, SeedrFolder};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+/// Metadata and settings for ingesting a downloaded file.
+pub struct IngestTarget<'a> {
+    /// Original release / file name from Seedr.
+    pub original_name: &'a str,
+    /// Renaming method applied.
+    pub rename_status: RenameStatus,
+    /// Whether to skip interactive prompts.
+    pub non_interactive: bool,
+}
 
 pub async fn download_and_ingest(
     client: &SeedrClient,
@@ -48,14 +59,14 @@ pub async fn download_and_ingest(
             .await?;
 
         println!("  {} Analyzing title with Gemini AI...", "•".cyan());
-        let info = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
-
-        organize_file(
-            &downloaded_path,
-            &info,
-            &cfg.jellyfin_media_dir,
+        let (info, status) = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
+        let target = IngestTarget {
+            original_name: &file.name,
+            rename_status: status,
             non_interactive,
-        )?;
+        };
+
+        organize_file(&downloaded_path, &info, &cfg.jellyfin_media_dir, &target)?;
     }
 
     println!("\n  {} Processing complete!", "✔".green().bold());
@@ -80,7 +91,7 @@ pub fn organize_file(
     source_file: &Path,
     info: &MediaInfo,
     media_root: &Path,
-    non_interactive: bool,
+    target: &IngestTarget,
 ) -> Result<PathBuf> {
     let dest_dir = media_root.join(&info.relative_folder);
     let dest_file = dest_dir.join(&info.clean_filename);
@@ -102,7 +113,7 @@ pub fn organize_file(
     );
     println!();
 
-    if !non_interactive && !confirm_move()? {
+    if !target.non_interactive && !confirm_move()? {
         println!("  {} Move skipped by user.", "•".yellow());
         return Ok(source_file.to_path_buf());
     }
@@ -114,15 +125,92 @@ pub fn organize_file(
         )
     })?;
 
-    // Attempt atomic rename, fall back to copy+remove if cross-device
     if fs::rename(source_file, &dest_file).is_err() {
         fs::copy(source_file, &dest_file)
             .with_context(|| format!("Failed to copy to Jellyfin: {}", dest_file.display()))?;
         let _ = fs::remove_file(source_file);
     }
 
+    let file_size = fs::metadata(&dest_file).map_or(0, |m| m.len());
+    let entry = HistoryEntry {
+        id: history::generate_id(),
+        original_name: target.original_name.to_string(),
+        clean_title: info.title.clone(),
+        file_path: dest_file.clone(),
+        file_size,
+        media_type: info.media_type.clone(),
+        year: info.year,
+        season: info.season,
+        episode: info.episode,
+        downloaded_at: history::current_timestamp(),
+        rename_status: target.rename_status,
+    };
+    let _ = history::add_history_entry(entry);
+
     println!("  {} Placed in Jellyfin media library!", "✔".green().bold());
     Ok(dest_file)
+}
+
+/// Moves and re-indexes an existing media file to match newly analyzed metadata.
+pub fn reorganize_media(
+    entry: &mut HistoryEntry,
+    new_info: &MediaInfo,
+    media_root: &Path,
+    new_status: RenameStatus,
+) -> Result<PathBuf> {
+    if !entry.file_path.exists() {
+        bail!("File no longer exists at: {}", entry.file_path.display());
+    }
+
+    let new_dest_dir = media_root.join(&new_info.relative_folder);
+    let new_dest_file = new_dest_dir.join(&new_info.clean_filename);
+
+    if new_dest_file != entry.file_path {
+        fs::create_dir_all(&new_dest_dir)?;
+        if fs::rename(&entry.file_path, &new_dest_file).is_err() {
+            fs::copy(&entry.file_path, &new_dest_file)?;
+            let _ = fs::remove_file(&entry.file_path);
+        }
+        clean_empty_parent_dirs(&entry.file_path, media_root);
+    }
+
+    entry.file_path.clone_from(&new_dest_file);
+    entry.clean_title.clone_from(&new_info.title);
+    entry.year = new_info.year;
+    entry.season = new_info.season;
+    entry.episode = new_info.episode;
+    entry.media_type = new_info.media_type.clone();
+    entry.rename_status = new_status;
+
+    history::update_history_entry(entry)?;
+    Ok(new_dest_file)
+}
+
+/// Permanently deletes a downloaded media file from disk and removes it from history.
+pub fn delete_media(entry: &HistoryEntry, media_root: &Path) -> Result<()> {
+    if entry.file_path.exists() {
+        fs::remove_file(&entry.file_path)
+            .with_context(|| format!("Failed to delete {}", entry.file_path.display()))?;
+        clean_empty_parent_dirs(&entry.file_path, media_root);
+    }
+    let _ = history::remove_history_entry(&entry.id)?;
+    Ok(())
+}
+
+/// Recursively removes empty parent directories up to, but not including, the media root.
+pub fn clean_empty_parent_dirs(file_path: &Path, root: &Path) {
+    let mut current = file_path.parent();
+    while let Some(dir) = current {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        let is_empty = fs::read_dir(dir).is_ok_and(|mut it| it.next().is_none());
+        if !is_empty {
+            break;
+        }
+        let _ = fs::remove_dir(dir);
+        current = dir.parent();
+    }
 }
 
 fn confirm_move() -> Result<bool> {

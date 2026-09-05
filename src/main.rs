@@ -2,6 +2,9 @@ mod attach;
 mod config;
 mod downloader;
 mod gemini;
+mod history;
+mod history_cli;
+mod history_ui;
 mod manager;
 mod modal;
 mod modal_handler;
@@ -65,6 +68,11 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
+    /// Manage downloaded media history (AI re-rename, manual rename, delete)
+    History {
+        #[command(subcommand)]
+        subcmd: Option<history_cli::HistoryCommands>,
+    },
     #[command(hide = true)]
     Worker { folder_id: u64 },
 }
@@ -103,6 +111,9 @@ async fn main() -> Result<()> {
             show,
         }) => {
             handle_config(&mut cfg, gemini_key, media_dir, show)?;
+        }
+        Some(Commands::History { subcmd }) => {
+            history_cli::handle_history_cli(subcmd, &cfg).await?;
         }
         None => {
             let client = get_authenticated_client().await?;

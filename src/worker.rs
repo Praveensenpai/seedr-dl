@@ -133,9 +133,14 @@ async fn run_worker_internal(folder_id: u64) -> Result<()> {
     }
 
     let gemini_key = get_gemini_key(&cfg);
-    let info = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
+    let (info, status) = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
+    let target = organizer::IngestTarget {
+        original_name: &file.name,
+        rename_status: status,
+        non_interactive: true,
+    };
 
-    organizer::organize_file(&downloaded_path, &info, &cfg.jellyfin_media_dir, true)?;
+    organizer::organize_file(&downloaded_path, &info, &cfg.jellyfin_media_dir, &target)?;
 
     if let Ok(mut t) = task.lock() {
         t.status = TaskStatus::Completed;

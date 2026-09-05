@@ -1,3 +1,5 @@
+use crate::history::HistoryEntry;
+use crate::history_ui::render_history;
 use crate::modal::{render_modal, Modal};
 use crate::seedr::{ListContentsResponse, SeedrFolder, SeedrTorrent};
 use crate::task::TaskState;
@@ -9,16 +11,36 @@ use ratatui::{
     Frame,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Cloud,
+    History,
+}
+
 pub struct AppState {
     pub list: ListContentsResponse,
     pub local_tasks: Vec<TaskState>,
+    pub history_entries: Vec<HistoryEntry>,
     pub selected: usize,
+    pub history_selected: usize,
+    pub view_mode: ViewMode,
     pub modal: Option<Modal>,
     pub status: Option<(String, bool)>,
 }
 
 pub fn draw_ui(f: &mut Frame, state: &AppState) {
     let size = f.area();
+    match state.view_mode {
+        ViewMode::Cloud => draw_cloud_view(f, state, size),
+        ViewMode::History => draw_history_view(f, state, size),
+    }
+
+    if let Some(modal) = &state.modal {
+        render_modal(f, size, modal);
+    }
+}
+
+fn draw_cloud_view(f: &mut Frame, state: &AppState, size: Rect) {
     let has_torrents = !state.list.torrents.is_empty();
     let has_tasks = !state.local_tasks.is_empty();
 
@@ -68,11 +90,22 @@ pub fn draw_ui(f: &mut Frame, state: &AppState) {
     );
     idx += 1;
 
-    render_footer(f, chunks[idx], state.status.as_ref());
+    render_footer(f, chunks[idx], state.status.as_ref(), state.view_mode);
+}
 
-    if let Some(modal) = &state.modal {
-        render_modal(f, size, modal);
-    }
+fn draw_history_view(f: &mut Frame, state: &AppState, size: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ])
+        .split(size);
+
+    render_storage(f, chunks[0], &state.list);
+    render_history(f, chunks[1], &state.history_entries, state.history_selected);
+    render_footer(f, chunks[2], state.status.as_ref(), state.view_mode);
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -82,7 +115,6 @@ fn render_storage(f: &mut Frame, area: Rect, list: &ListContentsResponse) {
         _ => (0, 0),
     };
     let ratio = if max_mb > 0 {
-        // reason: used_mb and max_mb represent megabytes (< 10^7), fitting safely in f64
         (used_mb as f64 / max_mb as f64).min(1.0)
     } else {
         0.0
@@ -141,7 +173,6 @@ fn render_local_tasks(f: &mut Frame, area: Rect, tasks: &[TaskState]) {
         .iter()
         .map(|t| {
             let pct = if t.total_bytes > 0 {
-                // reason: byte values fit safely in f64
                 (t.downloaded_bytes as f64 / t.total_bytes as f64) * 100.0
             } else {
                 0.0
@@ -220,7 +251,7 @@ fn render_folders(
     f.render_widget(list_widget, area);
 }
 
-fn render_footer(f: &mut Frame, area: Rect, status: Option<&(String, bool)>) {
+fn render_footer(f: &mut Frame, area: Rect, status: Option<&(String, bool)>, mode: ViewMode) {
     let text = if let Some((msg, is_err)) = status {
         if *is_err {
             Line::from(vec![
@@ -234,22 +265,40 @@ fn render_footer(f: &mut Frame, area: Rect, status: Option<&(String, bool)>) {
             ])
         }
     } else {
-        Line::from(vec![
-            Span::styled(" [↑/↓] ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("Select   "),
-            Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
-            Span::raw("Download / Attach   "),
-            Span::styled("[a] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Attach   "),
-            Span::styled("[m] ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("Add Magnet   "),
-            Span::styled("[d] ", Style::default().fg(Color::Red).bold()),
-            Span::raw("Delete   "),
-            Span::styled("[r] ", Style::default().fg(Color::White).bold()),
-            Span::raw("Refresh   "),
-            Span::styled("[q] ", Style::default().dim().bold()),
-            Span::raw("Quit"),
-        ])
+        match mode {
+            ViewMode::Cloud => Line::from(vec![
+                Span::styled(" [Tab] ", Style::default().fg(Color::Magenta).bold()),
+                Span::raw("History   "),
+                Span::styled("[↑/↓] ", Style::default().fg(Color::Cyan).bold()),
+                Span::raw("Select   "),
+                Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
+                Span::raw("Download   "),
+                Span::styled("[a] ", Style::default().fg(Color::Yellow).bold()),
+                Span::raw("Attach   "),
+                Span::styled("[m] ", Style::default().fg(Color::Cyan).bold()),
+                Span::raw("Magnet   "),
+                Span::styled("[d] ", Style::default().fg(Color::Red).bold()),
+                Span::raw("Delete   "),
+                Span::styled("[r] ", Style::default().fg(Color::White).bold()),
+                Span::raw("Refresh   "),
+                Span::styled("[q] ", Style::default().dim().bold()),
+                Span::raw("Quit"),
+            ]),
+            ViewMode::History => Line::from(vec![
+                Span::styled(" [Tab] ", Style::default().fg(Color::Magenta).bold()),
+                Span::raw("Cloud Items   "),
+                Span::styled("[↑/↓] ", Style::default().fg(Color::Cyan).bold()),
+                Span::raw("Select   "),
+                Span::styled("[r] ", Style::default().fg(Color::Green).bold()),
+                Span::raw("AI Rename   "),
+                Span::styled("[m] ", Style::default().fg(Color::Cyan).bold()),
+                Span::raw("Manual Rename   "),
+                Span::styled("[d] ", Style::default().fg(Color::Red).bold()),
+                Span::raw("Delete Media   "),
+                Span::styled("[q] ", Style::default().dim().bold()),
+                Span::raw("Quit"),
+            ]),
+        }
     };
 
     let block = Block::default()

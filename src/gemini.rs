@@ -1,3 +1,4 @@
+use crate::history::RenameStatus;
 use anyhow::Result;
 use regex::Regex;
 use reqwest::Client;
@@ -64,16 +65,67 @@ struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
 }
 
-pub async fn parse_media(raw_name: &str, api_key: Option<&str>) -> MediaInfo {
+/// Parses media filename with Gemini AI if key is present, otherwise falls back to regex.
+pub async fn parse_media(raw_name: &str, api_key: Option<&str>) -> (MediaInfo, RenameStatus) {
     if let Some(key) = api_key {
         if let Ok(info) = query_gemini(raw_name, key).await {
-            return info;
+            return (info, RenameStatus::Gemini);
         }
     }
-    parse_with_regex(raw_name)
+    (parse_with_regex(raw_name), RenameStatus::RegexFallback)
 }
 
-async fn query_gemini(raw_name: &str, api_key: &str) -> Result<MediaInfo> {
+/// Constructs `MediaInfo` from manual inputs.
+pub fn media_info_from_manual(
+    raw_name: &str,
+    title: &str,
+    year: Option<u32>,
+    season_ep: Option<(u32, u32)>,
+) -> MediaInfo {
+    let ext = Path::new(raw_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let title_clean = title.trim();
+
+    if let Some((s, e)) = season_ep {
+        let relative_folder = format!("shows/{title_clean}/Season {s:02}");
+        let clean_filename = format!("{title_clean} - S{s:02}E{e:02}{ext}");
+        MediaInfo {
+            media_type: MediaType::Show,
+            title: title_clean.to_string(),
+            year,
+            season: Some(s),
+            episode: Some(e),
+            relative_folder,
+            clean_filename,
+        }
+    } else {
+        let relative_folder = if let Some(y) = year {
+            format!("movies/{title_clean} ({y})")
+        } else {
+            format!("movies/{title_clean}")
+        };
+        let clean_filename = if let Some(y) = year {
+            format!("{title_clean} ({y}){ext}")
+        } else {
+            format!("{title_clean}{ext}")
+        };
+        MediaInfo {
+            media_type: MediaType::Movie,
+            title: title_clean.to_string(),
+            year,
+            season: None,
+            episode: None,
+            relative_folder,
+            clean_filename,
+        }
+    }
+}
+
+/// Queries Gemini API to analyze filename.
+pub async fn query_gemini(raw_name: &str, api_key: &str) -> Result<MediaInfo> {
     let prompt = format!(
         r#"Analyze this media release filename for a Jellyfin media server: "{raw_name}"
 Return strictly valid JSON with this schema:

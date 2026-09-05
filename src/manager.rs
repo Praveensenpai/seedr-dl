@@ -1,10 +1,12 @@
 use crate::attach::run_attach_loop;
-use crate::config::Config;
+use crate::config::{get_gemini_key, Config};
+use crate::gemini;
+use crate::history;
 use crate::modal::Modal;
 use crate::modal_handler::handle_modal_key;
 use crate::seedr::SeedrClient;
 use crate::task::list_active_tasks;
-use crate::ui::{self, AppState};
+use crate::ui::{self, AppState, ViewMode};
 use crate::worker::spawn_worker;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -31,11 +33,15 @@ pub async fn run_dashboard(
 ) -> Result<()> {
     let list = client.list_root().await?;
     let local_tasks = list_active_tasks();
+    let history_entries = history::load_history().unwrap_or_default();
     if non_interactive {
         let state = AppState {
             list,
             local_tasks,
+            history_entries,
             selected: 0,
+            history_selected: 0,
+            view_mode: ViewMode::Cloud,
             modal: None,
             status: None,
         };
@@ -52,7 +58,10 @@ pub async fn run_dashboard(
     let mut state = AppState {
         list,
         local_tasks,
+        history_entries,
         selected: 0,
+        history_selected: 0,
+        view_mode: ViewMode::Cloud,
         modal: None,
         status: None,
     };
@@ -71,6 +80,11 @@ async fn run_event_loop(
         state.local_tasks = list_active_tasks();
         if state.selected >= state.list.folders.len() && !state.list.folders.is_empty() {
             state.selected = state.list.folders.len() - 1;
+        }
+        if state.history_selected >= state.history_entries.len()
+            && !state.history_entries.is_empty()
+        {
+            state.history_selected = state.history_entries.len() - 1;
         }
         term.draw(|f| ui::draw_ui(f, state))?;
 
@@ -96,16 +110,30 @@ async fn handle_input(
     key: KeyEvent,
 ) -> Result<bool> {
     if let Some(modal) = state.modal.clone() {
-        handle_modal_key(state, client, cfg, term, modal, key.code).await
-    } else {
-        handle_main_key(state, client, cfg, term, key.code).await
+        return handle_modal_key(state, client, cfg, term, modal, key.code).await;
+    }
+
+    if key.code == KeyCode::Tab {
+        state.view_mode = match state.view_mode {
+            ViewMode::Cloud => {
+                state.history_entries = history::load_history().unwrap_or_default();
+                ViewMode::History
+            }
+            ViewMode::History => ViewMode::Cloud,
+        };
+        state.status = None;
+        return Ok(false);
+    }
+
+    match state.view_mode {
+        ViewMode::Cloud => handle_cloud_key(state, client, term, key.code).await,
+        ViewMode::History => handle_history_key(state, cfg, key.code).await,
     }
 }
 
-async fn handle_main_key(
+async fn handle_cloud_key(
     state: &mut AppState,
     client: &SeedrClient,
-    _cfg: &Config,
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     code: KeyCode,
 ) -> Result<bool> {
@@ -135,24 +163,7 @@ async fn handle_main_key(
             }
         }
         KeyCode::Char('a' | 'A') => {
-            let target_id = state
-                .list
-                .folders
-                .get(state.selected)
-                .map(|f| f.id)
-                .filter(|id| state.local_tasks.iter().any(|t| t.folder_id == *id))
-                .or_else(|| state.local_tasks.first().map(|t| t.folder_id));
-
-            if let Some(fid) = target_id {
-                run_attach_loop(term, fid).await?;
-                state.local_tasks = list_active_tasks();
-                state.list = client.list_root().await?;
-            } else {
-                state.status = Some((
-                    "No active downloads running to attach to.".to_string(),
-                    false,
-                ));
-            }
+            handle_attach_shortcut(state, client, term).await?;
         }
         KeyCode::Char('m' | '+') => {
             state.modal = Some(Modal::InputMagnet(String::new()));
@@ -181,4 +192,110 @@ async fn handle_main_key(
         _ => {}
     }
     Ok(false)
+}
+
+async fn handle_attach_shortcut(
+    state: &mut AppState,
+    client: &SeedrClient,
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    let target_id = state
+        .list
+        .folders
+        .get(state.selected)
+        .map(|f| f.id)
+        .filter(|id| state.local_tasks.iter().any(|t| t.folder_id == *id))
+        .or_else(|| state.local_tasks.first().map(|t| t.folder_id));
+
+    if let Some(fid) = target_id {
+        run_attach_loop(term, fid).await?;
+        state.local_tasks = list_active_tasks();
+        state.list = client.list_root().await?;
+    } else {
+        state.status = Some((
+            "No active downloads running to attach to.".to_string(),
+            false,
+        ));
+    }
+    Ok(())
+}
+
+async fn handle_history_key(state: &mut AppState, cfg: &Config, code: KeyCode) -> Result<bool> {
+    state.status = None;
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.history_selected = state.history_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !state.history_entries.is_empty()
+                && state.history_selected + 1 < state.history_entries.len()
+            {
+                state.history_selected += 1;
+            }
+        }
+        KeyCode::Char('r' | 'R') => {
+            trigger_history_ai_rename(state, cfg).await;
+        }
+        KeyCode::Char('m' | 'M') => {
+            trigger_history_manual_rename(state);
+        }
+        KeyCode::Char('d' | 'D' | 'x' | 'X') | KeyCode::Delete => {
+            trigger_history_delete(state);
+        }
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn trigger_history_ai_rename(state: &mut AppState, cfg: &Config) {
+    let Some(entry) = state.history_entries.get(state.history_selected).cloned() else {
+        return;
+    };
+    let Some(key) = get_gemini_key(cfg) else {
+        state.status = Some((
+            "Gemini API key not set. Use [m] for manual rename.".to_string(),
+            true,
+        ));
+        return;
+    };
+
+    state.status = Some(("Querying Gemini AI...".to_string(), false));
+    match gemini::query_gemini(&entry.original_name, &key).await {
+        Ok(new_info) => {
+            let target_path = cfg
+                .jellyfin_media_dir
+                .join(&new_info.relative_folder)
+                .join(&new_info.clean_filename);
+            state.modal = Some(Modal::ConfirmAiRename {
+                entry,
+                new_info,
+                target_path,
+            });
+        }
+        Err(e) => {
+            state.status = Some((format!("Gemini query failed: {e}"), true));
+        }
+    }
+}
+
+fn trigger_history_manual_rename(state: &mut AppState) {
+    if let Some(entry) = state.history_entries.get(state.history_selected).cloned() {
+        let yr_str = entry.year.map_or_else(String::new, |y| y.to_string());
+        state.modal = Some(Modal::InputManualRename {
+            entry: entry.clone(),
+            title: entry.clean_title,
+            year: yr_str,
+            active_field: 0,
+        });
+    }
+}
+
+fn trigger_history_delete(state: &mut AppState) {
+    if let Some(entry) = state.history_entries.get(state.history_selected).cloned() {
+        state.modal = Some(Modal::ConfirmDeleteMedia {
+            entry,
+            typed: String::new(),
+        });
+    }
 }

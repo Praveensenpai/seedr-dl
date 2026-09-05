@@ -1,5 +1,8 @@
 use crate::config::Config;
+use crate::gemini::{self, MediaInfo};
+use crate::history::{self, HistoryEntry, RenameStatus};
 use crate::modal::Modal;
+use crate::organizer::{delete_media, reorganize_media};
 use crate::seedr::{SeedrClient, SeedrFolder, SeedrTorrent};
 use crate::ui::AppState;
 use crate::worker::spawn_worker;
@@ -34,6 +37,24 @@ pub async fn handle_modal_key(
         }
         Modal::InputMagnet(text) => {
             handle_magnet_input(state, client, cfg, term, text, code).await?;
+        }
+        Modal::ConfirmAiRename {
+            entry,
+            new_info,
+            target_path: _,
+        } => {
+            handle_ai_rename_confirm(state, cfg, entry, &new_info, code)?;
+        }
+        Modal::InputManualRename {
+            entry,
+            title,
+            year,
+            active_field,
+        } => {
+            handle_manual_rename_input(state, cfg, entry, title, year, active_field, code)?;
+        }
+        Modal::ConfirmDeleteMedia { entry, typed } => {
+            handle_delete_media_confirm(state, cfg, entry, typed, code)?;
         }
     }
     Ok(false)
@@ -108,6 +129,150 @@ async fn handle_magnet_input(
             text.push(c);
             state.modal = Some(Modal::InputMagnet(text));
         }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_ai_rename_confirm(
+    state: &mut AppState,
+    cfg: &Config,
+    mut entry: HistoryEntry,
+    new_info: &MediaInfo,
+    code: KeyCode,
+) -> Result<()> {
+    if matches!(code, KeyCode::Enter | KeyCode::Char('y' | 'Y')) {
+        match reorganize_media(
+            &mut entry,
+            new_info,
+            &cfg.jellyfin_media_dir,
+            RenameStatus::Gemini,
+        ) {
+            Ok(_) => {
+                state.history_entries = history::load_history()?;
+                state.status = Some((format!("Renamed to '{}'", new_info.title), false));
+            }
+            Err(e) => {
+                state.status = Some((format!("Rename failed: {e}"), true));
+            }
+        }
+    }
+    state.modal = None;
+    Ok(())
+}
+
+fn handle_manual_rename_input(
+    state: &mut AppState,
+    cfg: &Config,
+    mut entry: HistoryEntry,
+    mut title: String,
+    mut year: String,
+    mut active_field: usize,
+    code: KeyCode,
+) -> Result<()> {
+    match code {
+        KeyCode::Tab => {
+            active_field = (active_field + 1) % 2;
+            state.modal = Some(Modal::InputManualRename {
+                entry,
+                title,
+                year,
+                active_field,
+            });
+        }
+        KeyCode::Backspace => {
+            if active_field == 0 {
+                title.pop();
+            } else {
+                year.pop();
+            }
+            state.modal = Some(Modal::InputManualRename {
+                entry,
+                title,
+                year,
+                active_field,
+            });
+        }
+        KeyCode::Char(c) => {
+            if active_field == 0 {
+                title.push(c);
+            } else if c.is_ascii_digit() && year.len() < 4 {
+                year.push(c);
+            }
+            state.modal = Some(Modal::InputManualRename {
+                entry,
+                title,
+                year,
+                active_field,
+            });
+        }
+        KeyCode::Enter => {
+            state.modal = None;
+            let y = year.trim().parse::<u32>().ok();
+            let s_ep = match (entry.season, entry.episode) {
+                (Some(s), Some(e)) => Some((s, e)),
+                _ => None,
+            };
+            let new_info = gemini::media_info_from_manual(&entry.original_name, &title, y, s_ep);
+            match reorganize_media(
+                &mut entry,
+                &new_info,
+                &cfg.jellyfin_media_dir,
+                RenameStatus::Manual,
+            ) {
+                Ok(_) => {
+                    state.history_entries = history::load_history()?;
+                    state.status = Some((format!("Renamed to '{title}'"), false));
+                }
+                Err(e) => {
+                    state.status = Some((format!("Rename failed: {e}"), true));
+                }
+            }
+        }
+        KeyCode::Esc => state.modal = None,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_delete_media_confirm(
+    state: &mut AppState,
+    cfg: &Config,
+    entry: HistoryEntry,
+    mut typed: String,
+    code: KeyCode,
+) -> Result<()> {
+    match code {
+        KeyCode::Backspace => {
+            typed.pop();
+            state.modal = Some(Modal::ConfirmDeleteMedia { entry, typed });
+        }
+        KeyCode::Char(c) => {
+            if typed.len() < 10 {
+                typed.push(c);
+            }
+            state.modal = Some(Modal::ConfirmDeleteMedia { entry, typed });
+        }
+        KeyCode::Enter => {
+            if typed == "DELETE" {
+                state.modal = None;
+                match delete_media(&entry, &cfg.jellyfin_media_dir) {
+                    Ok(()) => {
+                        state.history_entries = history::load_history()?;
+                        state.status = Some((
+                            format!("Permanently deleted '{}'", entry.clean_title),
+                            false,
+                        ));
+                    }
+                    Err(e) => {
+                        state.status = Some((format!("Delete failed: {e}"), true));
+                    }
+                }
+            } else {
+                state.status = Some(("Type 'DELETE' to confirm deletion.".to_string(), true));
+            }
+        }
+        KeyCode::Esc => state.modal = None,
         _ => {}
     }
     Ok(())
