@@ -1,148 +1,235 @@
-use crate::config::{cache_dir, get_gemini_key, Config};
-use crate::downloader::Downloader;
-use crate::gemini;
-use crate::organizer;
-use crate::seedr::{ListContentsResponse, SeedrClient, SeedrFolder};
-use anyhow::{Context, Result};
+use crate::config::Config;
+use crate::modal::Modal;
+use crate::organizer::download_and_ingest;
+use crate::seedr::SeedrClient;
+use crate::ui::{self, AppState};
+use anyhow::Result;
 use colored::Colorize;
-use std::io::{self, Write};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use std::io::{self, Stdout, Write};
+
+struct TuiGuard;
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    }
+}
 
 pub async fn run_dashboard(
     client: &SeedrClient,
     cfg: &Config,
     non_interactive: bool,
 ) -> Result<()> {
+    let list = client.list_root().await?;
+    if non_interactive {
+        let state = AppState {
+            list,
+            selected: 0,
+            modal: None,
+            status: None,
+        };
+        let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        term.draw(|f| ui::draw_ui(f, &state))?;
+        return Ok(());
+    }
+
+    let _guard = TuiGuard;
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+
+    let mut state = AppState {
+        list,
+        selected: 0,
+        modal: None,
+        status: None,
+    };
+
+    run_event_loop(&mut term, &mut state, client, cfg).await?;
+    Ok(())
+}
+
+async fn run_event_loop(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    state: &mut AppState,
+    client: &SeedrClient,
+    cfg: &Config,
+) -> Result<()> {
     loop {
-        let list = client.list_root().await?;
-        print_dashboard(&list);
-
-        if non_interactive {
-            break;
+        if state.selected >= state.list.folders.len() && !state.list.folders.is_empty() {
+            state.selected = state.list.folders.len() - 1;
         }
+        term.draw(|f| ui::draw_ui(f, state))?;
 
-        print!("  Action: ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let cmd = input.trim().to_lowercase();
-
-        match cmd.as_str() {
-            "q" | "exit" | "0" => break,
-            "r" | "refresh" => {}
-            "a" | "add" => handle_add_prompt(client, cfg).await?,
-            "c" | "clean" => handle_clean_all(client, &list.folders).await?,
-            _ => {
-                if let Some(rest) = cmd.strip_prefix("dt ") {
-                    handle_delete_torrent(client, &list.torrents, rest).await?;
-                } else if let Some(rest) =
-                    cmd.strip_prefix("d ").or_else(|| cmd.strip_prefix("rm "))
-                {
-                    handle_delete_by_index(client, &list.folders, rest).await?;
-                } else if let Ok(idx) = cmd.parse::<usize>() {
-                    if idx > 0 && idx <= list.folders.len() {
-                        let folder = &list.folders[idx - 1];
-                        download_and_ingest(client, cfg, folder, false).await?;
-                    } else {
-                        println!("  {} Invalid item number.", "✖".red());
-                    }
-                }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if handle_input(term, state, client, cfg, key).await? {
+                break;
             }
         }
     }
     Ok(())
 }
 
-fn print_dashboard(list: &ListContentsResponse) {
-    println!();
-    println!(
-        "  {}",
-        "┌────────────────────────────────────────────────────────┐".cyan()
-    );
-    println!(
-        "  {}  ⚡ {}  {}",
-        "│".cyan(),
-        "Seedr Cloud Manager & Jellyfin Pipeline".bold(),
-        "│".cyan()
-    );
-    println!(
-        "  {}",
-        "└────────────────────────────────────────────────────────┘".cyan()
-    );
-
-    if let (Some(used), Some(max)) = (list.space_used, list.space_max) {
-        let used_mb = used / 1_048_576;
-        let max_mb = max / 1_048_576;
-        let free_mb = max_mb.saturating_sub(used_mb);
-        let bar = storage_progress_bar(used_mb, max_mb);
-        println!("  • Storage: [{bar}] {used_mb} MB / {max_mb} MB ({free_mb} MB free)");
-    }
-
-    if !list.torrents.is_empty() {
-        println!(
-            "\n  {}",
-            "── Active Cloud Downloads ─────────────────────────────".yellow()
-        );
-        for (i, t) in list.torrents.iter().enumerate() {
-            let pct = t.progress.unwrap_or(0.0);
-            let sz = t.size.unwrap_or(0) / 1_048_576;
-            println!("  [t{}] ⏳ {} ({} MB, {:.1}%)", i + 1, t.name, sz, pct);
-        }
-    }
-
-    println!(
-        "\n  {}",
-        "── Completed Cloud Items ──────────────────────────────".cyan()
-    );
-    if list.folders.is_empty() {
-        println!("  {} (no completed files in cloud)", "•".dimmed());
+async fn handle_input(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    state: &mut AppState,
+    client: &SeedrClient,
+    cfg: &Config,
+    key: KeyEvent,
+) -> Result<bool> {
+    if let Some(modal) = state.modal.clone() {
+        handle_modal_key(state, client, cfg, term, modal, key.code).await
     } else {
-        for (idx, f) in list.folders.iter().enumerate() {
-            let sz = f.size.unwrap_or(0) / 1_048_576;
-            println!("  [{}] 📁 {} ({} MB)", idx + 1, f.name.bold(), sz);
+        handle_main_key(state, client, cfg, term, key.code).await
+    }
+}
+
+async fn handle_main_key(
+    state: &mut AppState,
+    client: &SeedrClient,
+    cfg: &Config,
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    code: KeyCode,
+) -> Result<bool> {
+    state.status = None;
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
         }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !state.list.folders.is_empty() && state.selected + 1 < state.list.folders.len() {
+                state.selected += 1;
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            trigger_download(state, client, cfg, term).await?;
+        }
+        KeyCode::Char('d' | 'x') | KeyCode::Delete => {
+            if let Some(f) = state.list.folders.get(state.selected) {
+                state.modal = Some(Modal::ConfirmDelete(f.clone()));
+            }
+        }
+        KeyCode::Char('t') => {
+            if let Some(t) = state.list.torrents.first() {
+                state.modal = Some(Modal::ConfirmCancelTorrent(t.clone()));
+            }
+        }
+        KeyCode::Char('a') => {
+            state.modal = Some(Modal::InputMagnet(String::new()));
+        }
+        KeyCode::Char('c') => {
+            if !state.list.folders.is_empty() {
+                state.modal = Some(Modal::ConfirmCleanAll(state.list.folders.len()));
+            }
+        }
+        KeyCode::Char('r') => {
+            state.list = client.list_root().await?;
+            state.status = Some(("Refreshed Seedr cloud data.".to_string(), false));
+        }
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        _ => {}
     }
-
-    println!(
-        "\n  {}",
-        "── Commands ───────────────────────────────────────────".dimmed()
-    );
-    println!("  [1-N] Download & move to Jellyfin   [d N]  Delete completed item N");
-    println!("  [dt N] Cancel active torrent N      [c]    Delete ALL cloud folders");
-    println!("  [a]   Add magnet link               [r]    Refresh");
-    println!("  [q]   Quit manager");
-    println!();
+    Ok(false)
 }
 
-fn storage_progress_bar(used: u64, max: u64) -> String {
-    let width = 20;
-    if max == 0 {
-        return "░".repeat(width);
+async fn handle_modal_key(
+    state: &mut AppState,
+    client: &SeedrClient,
+    cfg: &Config,
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    modal: Modal,
+    code: KeyCode,
+) -> Result<bool> {
+    match modal {
+        Modal::ConfirmDelete(folder) => {
+            if matches!(code, KeyCode::Enter | KeyCode::Char('y' | 'Y')) {
+                client.delete_folder(folder.id).await?;
+                state.list = client.list_root().await?;
+                state.status = Some((format!("Deleted '{}'", folder.name), false));
+                state.modal = None;
+            } else if matches!(code, KeyCode::Esc | KeyCode::Char('n' | 'N')) {
+                state.modal = None;
+            }
+        }
+        Modal::ConfirmCancelTorrent(torrent) => {
+            if matches!(code, KeyCode::Enter | KeyCode::Char('y' | 'Y')) {
+                client.delete_torrent(torrent.id).await?;
+                state.list = client.list_root().await?;
+                state.status = Some((format!("Cancelled '{}'", torrent.name), false));
+                state.modal = None;
+            } else if matches!(code, KeyCode::Esc | KeyCode::Char('n' | 'N')) {
+                state.modal = None;
+            }
+        }
+        Modal::ConfirmCleanAll(_) => {
+            if matches!(code, KeyCode::Enter | KeyCode::Char('y' | 'Y')) {
+                client.delete_all_folders(&state.list.folders).await?;
+                state.list = client.list_root().await?;
+                state.status = Some(("All cloud folders deleted.".to_string(), false));
+                state.modal = None;
+            } else if matches!(code, KeyCode::Esc | KeyCode::Char('n' | 'N')) {
+                state.modal = None;
+            }
+        }
+        Modal::InputMagnet(mut text) => match code {
+            KeyCode::Enter => {
+                state.modal = None;
+                if !text.is_empty() {
+                    execute_add_magnet(state, client, cfg, term, &text).await?;
+                }
+            }
+            KeyCode::Esc => state.modal = None,
+            KeyCode::Backspace => {
+                text.pop();
+                state.modal = Some(Modal::InputMagnet(text));
+            }
+            KeyCode::Char(c) => {
+                text.push(c);
+                state.modal = Some(Modal::InputMagnet(text));
+            }
+            _ => {}
+        },
     }
-    let filled = usize::try_from((used * width as u64) / max)
-        .unwrap_or(0)
-        .min(width);
-    let empty = width - filled;
-    format!(
-        "{}{}",
-        "█".repeat(filled).yellow(),
-        "░".repeat(empty).dimmed()
-    )
+    Ok(false)
 }
 
-async fn handle_add_prompt(client: &SeedrClient, cfg: &Config) -> Result<()> {
-    print!("  Paste magnet link or torrent URL: ");
-    io::stdout().flush()?;
-    let mut magnet = String::new();
-    io::stdin().read_line(&mut magnet)?;
-    let magnet = magnet.trim();
-    if magnet.is_empty() {
-        return Ok(());
+async fn trigger_download(
+    state: &mut AppState,
+    client: &SeedrClient,
+    cfg: &Config,
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    if let Some(folder) = state.list.folders.get(state.selected).cloned() {
+        pause_tui()?;
+        download_and_ingest(client, cfg, &folder, false).await?;
+        resume_tui(term)?;
+        state.list = client.list_root().await?;
+        state.status = Some((format!("Ingested '{}'", folder.name), false));
     }
+    Ok(())
+}
 
-    println!("  {} Sending to Seedr cloud...", "•".cyan());
+async fn execute_add_magnet(
+    state: &mut AppState,
+    client: &SeedrClient,
+    cfg: &Config,
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    magnet: &str,
+) -> Result<()> {
+    pause_tui()?;
+    println!("  {} Sending magnet to Seedr cloud...", "•".cyan());
     let id = client.add_magnet(magnet).await?;
     let folder = client.wait_for_caching(id, "Torrent").await?;
-
     if let Some(f) = folder {
         print!("  Download and ingest into Jellyfin now? [Y/n]: ");
         io::stdout().flush()?;
@@ -153,121 +240,20 @@ async fn handle_add_prompt(client: &SeedrClient, cfg: &Config) -> Result<()> {
             download_and_ingest(client, cfg, &f, false).await?;
         }
     }
+    resume_tui(term)?;
+    state.list = client.list_root().await?;
     Ok(())
 }
 
-async fn handle_delete_by_index(
-    client: &SeedrClient,
-    folders: &[SeedrFolder],
-    rest: &str,
-) -> Result<()> {
-    let idx: usize = rest.trim().parse().unwrap_or(0);
-    if idx == 0 || idx > folders.len() {
-        println!("  {} Invalid folder number: {rest}", "✖".red());
-        return Ok(());
-    }
-    let folder = &folders[idx - 1];
-    print!("  Delete '{}' from cloud? [y/N]: ", folder.name);
-    io::stdout().flush()?;
-    let mut ans = String::new();
-    io::stdin().read_line(&mut ans)?;
-    if ans.trim().eq_ignore_ascii_case("y") {
-        client.delete_folder(folder.id).await?;
-        println!(
-            "  {} Deleted '{}' from Seedr cloud.",
-            "✔".green(),
-            folder.name
-        );
-    }
+fn pause_tui() -> Result<()> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show)?;
     Ok(())
 }
 
-async fn handle_delete_torrent(
-    client: &SeedrClient,
-    torrents: &[crate::seedr::SeedrTorrent],
-    rest: &str,
-) -> Result<()> {
-    let idx: usize = rest.trim().parse().unwrap_or(0);
-    if idx == 0 || idx > torrents.len() {
-        println!("  {} Invalid torrent number: {rest}", "✖".red());
-        return Ok(());
-    }
-    let t = &torrents[idx - 1];
-    print!("  Cancel and delete torrent '{}'? [y/N]: ", t.name);
-    io::stdout().flush()?;
-    let mut ans = String::new();
-    io::stdin().read_line(&mut ans)?;
-    if ans.trim().eq_ignore_ascii_case("y") {
-        client.delete_torrent(t.id).await?;
-        println!("  {} Deleted torrent '{}' from cloud.", "✔".green(), t.name);
-    }
-    Ok(())
-}
-
-async fn handle_clean_all(client: &SeedrClient, folders: &[SeedrFolder]) -> Result<()> {
-    if folders.is_empty() {
-        println!("  {} No completed folders to delete.", "•".dimmed());
-        return Ok(());
-    }
-    print!(
-        "  Delete all {} cloud folders to free space? [y/N]: ",
-        folders.len()
-    );
-    io::stdout().flush()?;
-    let mut ans = String::new();
-    io::stdin().read_line(&mut ans)?;
-    if ans.trim().eq_ignore_ascii_case("y") {
-        client.delete_all_folders(folders).await?;
-        println!("  {} All cloud folders deleted!", "✔".green());
-    }
-    Ok(())
-}
-
-pub async fn download_and_ingest(
-    client: &SeedrClient,
-    cfg: &Config,
-    folder: &SeedrFolder,
-    non_interactive: bool,
-) -> Result<()> {
-    let contents = client.list_folder(folder.id).await?;
-    let gemini_key = get_gemini_key(cfg);
-    let downloader = Downloader::new();
-    let temp_dir = cache_dir();
-
-    for file in &contents.files {
-        let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;
-        let sz_mb = file.size / 1_048_576;
-        println!(
-            "\n  {} Fetching download URL for: {} ({} MB)",
-            "•".cyan(),
-            file.name,
-            sz_mb
-        );
-        let download_url = client.get_download_url(file_id).await?;
-
-        let downloaded_path = downloader
-            .download(&download_url, &temp_dir, &file.name)
-            .await?;
-
-        println!("  {} Analyzing title with Gemini AI...", "•".cyan());
-        let info = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
-
-        organizer::organize_file(
-            &downloaded_path,
-            &info,
-            &cfg.jellyfin_media_dir,
-            non_interactive,
-        )?;
-    }
-
-    print!("  Delete item from Seedr cloud to free space? [y/N]: ");
-    io::stdout().flush()?;
-    let mut del_input = String::new();
-    io::stdin().read_line(&mut del_input)?;
-    if del_input.trim().eq_ignore_ascii_case("y") {
-        client.delete_folder(folder.id).await?;
-        println!("  {} Cloud item deleted.", "✔".green());
-    }
-
+fn resume_tui(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    term.clear()?;
     Ok(())
 }

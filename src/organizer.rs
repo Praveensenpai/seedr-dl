@@ -1,9 +1,66 @@
-use crate::gemini::MediaInfo;
+use crate::config::{cache_dir, get_gemini_key, Config};
+use crate::downloader::Downloader;
+use crate::gemini::{self, MediaInfo};
+use crate::seedr::{SeedrClient, SeedrFolder};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+pub async fn download_and_ingest(
+    client: &SeedrClient,
+    cfg: &Config,
+    folder: &SeedrFolder,
+    non_interactive: bool,
+) -> Result<()> {
+    let contents = client.list_folder(folder.id).await?;
+    let gemini_key = get_gemini_key(cfg);
+    let downloader = Downloader::new();
+    let temp_dir = cache_dir();
+
+    for file in &contents.files {
+        let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;
+        let sz_mb = file.size / 1_048_576;
+        println!(
+            "\n  {} Fetching download URL for: {} ({} MB)",
+            "•".cyan(),
+            file.name,
+            sz_mb
+        );
+        let download_url = client.get_download_url(file_id).await?;
+
+        let downloaded_path = downloader
+            .download(&download_url, &temp_dir, &file.name)
+            .await?;
+
+        println!("  {} Analyzing title with Gemini AI...", "•".cyan());
+        let info = gemini::parse_media(&file.name, gemini_key.as_deref()).await;
+
+        organize_file(
+            &downloaded_path,
+            &info,
+            &cfg.jellyfin_media_dir,
+            non_interactive,
+        )?;
+    }
+
+    print!("  Delete item from Seedr cloud to free space? [y/N]: ");
+    io::stdout().flush()?;
+    let mut del_input = String::new();
+    io::stdin().read_line(&mut del_input)?;
+    if del_input.trim().eq_ignore_ascii_case("y") {
+        client.delete_folder(folder.id).await?;
+        println!("  {} Cloud item deleted.", "✔".green());
+    }
+
+    print!("\n  Press [Enter] to return to manager...");
+    io::stdout().flush()?;
+    let mut pause_line = String::new();
+    io::stdin().read_line(&mut pause_line)?;
+
+    Ok(())
+}
 
 pub fn organize_file(
     source_file: &Path,

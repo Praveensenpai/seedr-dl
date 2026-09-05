@@ -2,8 +2,10 @@ mod config;
 mod downloader;
 mod gemini;
 mod manager;
+mod modal;
 mod organizer;
 mod seedr;
+mod ui;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -179,5 +181,5 @@ async fn handle_direct_magnet(
         .await?
         .context("Could not find completed folder in Seedr cloud")?;
 
-    manager::download_and_ingest(client, cfg, &folder, non_interactive).await
+    organizer::download_and_ingest(client, cfg, &folder, non_interactive).await
 }
