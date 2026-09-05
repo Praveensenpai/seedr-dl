@@ -44,7 +44,7 @@ pub async fn download_and_ingest(
         let download_url = client.get_download_url(file_id).await?;
 
         let downloaded_path = downloader
-            .download(&download_url, &temp_dir, &file.name)
+            .download_with_callback(&download_url, &temp_dir, &file.name, |_, _, _, _| {})
             .await?;
 
         println!("  {} Analyzing title with Gemini AI...", "•".cyan());

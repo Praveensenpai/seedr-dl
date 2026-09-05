@@ -1,16 +1,17 @@
 use anyhow::{Context, Result};
-use colored::Colorize;
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::RANGE;
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-pub type ProgressCallback = Box<dyn Fn(u64, u64, u64, u64) + Send>;
+const THREADS: u64 = 8;
+
+pub type ProgressCallback = Arc<dyn Fn(u64, u64, u64, u64) + Send + Sync>;
 
 pub struct Downloader {
     client: Client,
@@ -37,11 +38,6 @@ impl Downloader {
         }
     }
 
-    pub async fn download(&self, url: &str, target_dir: &Path, file_name: &str) -> Result<PathBuf> {
-        self.download_internal(url, target_dir, file_name, None)
-            .await
-    }
-
     pub async fn download_with_callback<F>(
         &self,
         url: &str,
@@ -50,119 +46,212 @@ impl Downloader {
         callback: F,
     ) -> Result<PathBuf>
     where
-        F: Fn(u64, u64, u64, u64) + Send + 'static,
+        F: Fn(u64, u64, u64, u64) + Send + Sync + 'static,
     {
-        self.download_internal(url, target_dir, file_name, Some(Box::new(callback)))
+        self.download_parallel(url, target_dir, file_name, Arc::new(callback))
             .await
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    async fn download_internal(
+    async fn download_parallel(
         &self,
         url: &str,
         target_dir: &Path,
         file_name: &str,
-        callback: Option<ProgressCallback>,
+        callback: ProgressCallback,
     ) -> Result<PathBuf> {
         fs::create_dir_all(target_dir).await?;
         let final_path = target_dir.join(file_name);
-        let temp_path = target_dir.join(format!("{file_name}.part"));
 
-        let existing = fs::metadata(&temp_path).await.map_or(0, |m| m.len());
+        let total_size = self.fetch_content_length(url).await?;
+        let chunk_size = total_size.div_ceil(THREADS);
 
-        let mut req = self.client.get(url);
-        if existing > 0 {
-            req = req.header(RANGE, format!("bytes={existing}-"));
-        }
+        // Pre-allocate the output file
+        let out_file = File::create(&final_path).await?;
+        out_file.set_len(total_size).await?;
+        drop(out_file);
 
-        println!("  {} Connecting to download stream...", "•".dimmed());
-        let res = req.send().await.context("Failed to connect to stream")?;
-        let status = res.status();
-
-        let (mut file, mut downloaded, total_size) = if status == StatusCode::PARTIAL_CONTENT {
-            let total = existing + res.content_length().unwrap_or(0);
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&temp_path)
-                .await?;
-            (f, existing, total)
-        } else {
-            let total = res.content_length().unwrap_or(0);
-            let f = File::create(&temp_path).await?;
-            (f, 0, total)
-        };
-
-        let pb = create_progress_bar(total_size, file_name)?;
-        pb.set_position(downloaded);
-
-        let mut stream = res.bytes_stream();
+        let downloaded = Arc::new(Mutex::new(0u64));
         let start_time = Instant::now();
-        let mut last_cb = Instant::now();
-        let mut last_bytes = downloaded;
+        let last_cb = Arc::new(Mutex::new(Instant::now()));
+        let last_bytes = Arc::new(Mutex::new(0u64));
 
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = chunk_res.context("Network error during streaming")?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            pb.set_position(downloaded);
+        // Compute chunk done bytes from existing chunk part files
+        let mut initial_total: u64 = 0;
+        for i in 0..THREADS {
+            let chunk_start = i * chunk_size;
+            let chunk_end = ((i + 1) * chunk_size).min(total_size) - 1;
+            let chunk_len = chunk_end - chunk_start + 1;
+            let done = self.chunk_done_bytes(target_dir, file_name, i, chunk_len).await;
+            initial_total += done;
+        }
+        if let Ok(mut d) = downloaded.lock() {
+            *d = initial_total;
+        }
 
-            if last_cb.elapsed() >= Duration::from_millis(500) {
-                let dur = last_cb.elapsed().as_secs_f64();
-                let speed = if dur > 0.0 {
-                    // reason: rate measurement calculation fits safely in u64
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    (((downloaded - last_bytes) as f64 / dur) as u64)
-                } else {
-                    0
-                };
-                let rem = total_size.saturating_sub(downloaded);
-                let eta = rem.checked_div(speed).unwrap_or(0);
-                if let Some(ref cb) = callback {
-                    cb(downloaded, total_size, speed, eta);
-                }
-                last_cb = Instant::now();
-                last_bytes = downloaded;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut handles = Vec::with_capacity(THREADS as usize);
+        for i in 0..THREADS {
+            let chunk_start = i * chunk_size;
+            let chunk_end = ((i + 1) * chunk_size).min(total_size) - 1;
+            let chunk_len = chunk_end - chunk_start + 1;
+            let done = self.chunk_done_bytes(target_dir, file_name, i, chunk_len).await;
+
+            if done >= chunk_len {
+                continue; // already complete
             }
+
+            let client = self.client.clone();
+            let url = url.to_string();
+            let path = final_path.clone();
+            let part_path = target_dir.join(format!("{file_name}.part.{i}"));
+            let downloaded = Arc::clone(&downloaded);
+            let last_cb = Arc::clone(&last_cb);
+            let last_bytes = Arc::clone(&last_bytes);
+            let cb = Arc::clone(&callback);
+
+            let resume_from = chunk_start + done;
+
+            let handle = tokio::spawn(async move {
+                download_chunk(
+                    &client,
+                    &url,
+                    &path,
+                    &part_path,
+                    chunk_start,
+                    resume_from,
+                    chunk_end,
+                    chunk_len,
+                    done,
+                    total_size,
+                    downloaded,
+                    last_cb,
+                    last_bytes,
+                    cb,
+                )
+                .await
+            });
+            handles.push(handle);
         }
 
-        file.flush().await?;
-        drop(file);
-
-        fs::rename(&temp_path, &final_path).await?;
-        pb.finish_with_message(format!("{} Download complete!", "✔".green().bold()));
-
-        if let Some(ref cb) = callback {
-            let total_dur = start_time.elapsed().as_secs();
-            let avg_spd = downloaded.checked_div(total_dur).unwrap_or(0);
-            cb(downloaded, total_size, avg_spd, 0);
+        for handle in handles {
+            handle.await.context("Chunk task panicked")??;
         }
+
+        // Clean up part tracking files
+        for i in 0..THREADS {
+            let part_path = target_dir.join(format!("{file_name}.part.{i}"));
+            let _ = fs::remove_file(part_path).await;
+        }
+
+        // Final callback
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed = start_time.elapsed().as_secs().max(1);
+        let avg_spd = total_size.checked_div(elapsed).unwrap_or(0);
+        callback(total_size, total_size, avg_spd, 0);
 
         Ok(final_path)
     }
+
+    async fn fetch_content_length(&self, url: &str) -> Result<u64> {
+        let res = self
+            .client
+            .head(url)
+            .send()
+            .await
+            .context("HEAD request failed")?;
+        res.content_length()
+            .context("Server did not return Content-Length")
+    }
+
+    async fn chunk_done_bytes(&self, dir: &Path, name: &str, idx: u64, chunk_len: u64) -> u64 {
+        let part = dir.join(format!("{name}.part.{idx}"));
+        fs::metadata(&part)
+            .await
+            .map_or(0, |m| m.len().min(chunk_len))
+    }
 }
 
-fn create_progress_bar(total_size: u64, file_name: &str) -> Result<ProgressBar> {
-    let pb = if total_size > 0 {
-        ProgressBar::new(total_size)
-    } else {
-        ProgressBar::new_spinner()
-    };
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+async fn download_chunk(
+    client: &Client,
+    url: &str,
+    final_path: &Path,
+    part_path: &Path,
+    _chunk_start: u64,
+    resume_from: u64,
+    chunk_end: u64,
+    chunk_len: u64,
+    already_done: u64,
+    total_size: u64,
+    downloaded: Arc<Mutex<u64>>,
+    last_cb: Arc<Mutex<Instant>>,
+    last_bytes: Arc<Mutex<u64>>,
+    callback: ProgressCallback,
+) -> Result<()> {
+    let range = format!("bytes={resume_from}-{chunk_end}");
+    let res = client
+        .get(url)
+        .header(RANGE, &range)
+        .send()
+        .await
+        .context("Chunk request failed")?;
 
-    let template = if total_size > 0 {
-        format!(
-            "  {{spinner:.cyan}} {file_name}\n  [{{elapsed_precise}}] [{{bar:35.cyan/blue}}] {{bytes}}/{{total_bytes}} ({{bytes_per_sec}}, ETA {{eta}})"
-        )
-    } else {
-        format!(
-            "  {{spinner:.cyan}} {file_name} [{{elapsed_precise}}] {{bytes}} ({{bytes_per_sec}})"
-        )
-    };
+    let out = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(final_path)
+        .await?;
+    let mut out = tokio::io::BufWriter::new(out);
+    out.seek(tokio::io::SeekFrom::Start(resume_from)).await?;
 
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(&template)?
-            .progress_chars("━╸─"),
-    );
-    Ok(pb)
+    let mut part_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(part_path)
+        .await?;
+
+    let mut stream = res.bytes_stream();
+    let mut chunk_downloaded = already_done;
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.context("Network error in chunk stream")?;
+        let len = chunk.len() as u64;
+
+        out.write_all(&chunk).await?;
+        part_file.write_all(&chunk).await?;
+        chunk_downloaded += len;
+
+        if let Ok(mut d) = downloaded.lock() {
+            *d += len;
+        }
+
+        if let Ok(mut t) = last_cb.lock() {
+            if t.elapsed() >= Duration::from_millis(400) {
+                let dur = t.elapsed().as_secs_f64();
+                let total_dl = downloaded.lock().map_or(0, |d| *d);
+                let last = last_bytes.lock().map_or(0, |b| *b);
+                let speed = if dur > 0.0 {
+                    ((total_dl.saturating_sub(last)) as f64 / dur) as u64
+                } else {
+                    0
+                };
+                let rem = total_size.saturating_sub(total_dl);
+                let eta = rem.checked_div(speed).unwrap_or(0);
+                callback(total_dl, total_size, speed, eta);
+                *t = Instant::now();
+                if let Ok(mut b) = last_bytes.lock() {
+                    *b = total_dl;
+                }
+            }
+        }
+
+        if chunk_downloaded >= chunk_len {
+            break;
+        }
+    }
+
+    out.flush().await?;
+    Ok(())
 }
+
