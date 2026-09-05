@@ -9,18 +9,37 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  # Step 1: Create the release once (not per-matrix)
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create.outputs.upload_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  # Step 2: Build binaries in parallel and attach to release
+  build:
     name: Build (${{ matrix.target }})
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            artifact: seedr-dl
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: seedr-dl
 
     steps:
       - uses: actions/checkout@v4
@@ -37,13 +56,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage artifact
+      - name: Rename binary
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} \
-             ${{ matrix.artifact }}-${{ github.ref_name }}-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/seedr-dl \
+             seedr-dl-${{ github.ref_name }}-${{ matrix.target }}
 
-      - name: Upload to GitHub Release
+      - name: Attach binary to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact }}-${{ github.ref_name }}-${{ matrix.target }}
-          generate_release_notes: false
+          files: seedr-dl-${{ github.ref_name }}-${{ matrix.target }}
