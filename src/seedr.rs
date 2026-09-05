@@ -228,7 +228,7 @@ impl SeedrClient {
 
     pub async fn list_folder(&self, folder_id: u64) -> Result<ListContentsResponse> {
         let url = format!(
-            "{SEEDR_RESOURCE_URL}?func=list_contents&folder_id={folder_id}&access_token={}",
+            "https://www.seedr.cc/api/folder/{folder_id}?access_token={}",
             self.token
         );
         let resp = self.client.get(&url).send().await?;
@@ -237,11 +237,18 @@ impl SeedrClient {
     }
 
     pub async fn get_download_url(&self, file_id: u64) -> Result<String> {
-        let url = format!(
-            "{SEEDR_RESOURCE_URL}?func=fetch_file&folder_file_id={file_id}&access_token={}",
-            self.token
-        );
-        let resp = self.client.get(&url).send().await?;
+        let file_str = file_id.to_string();
+        let params = [
+            ("func", "fetch_file"),
+            ("folder_file_id", &file_str),
+            ("access_token", &self.token),
+        ];
+        let resp = self
+            .client
+            .post(SEEDR_RESOURCE_URL)
+            .form(&params)
+            .send()
+            .await?;
         let res: GenericResponse = resp.json().await?;
         res.url.context("Download URL not found in Seedr response")
     }

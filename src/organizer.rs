@@ -15,6 +15,19 @@ pub async fn download_and_ingest(
     non_interactive: bool,
 ) -> Result<()> {
     let contents = client.list_folder(folder.id).await?;
+    if contents.files.is_empty() {
+        println!(
+            "\n  {} No files found inside cloud folder '{}'.",
+            "✖".red(),
+            folder.name
+        );
+        print!("\n  Press [Enter] to return to manager...");
+        io::stdout().flush()?;
+        let mut pause = String::new();
+        io::stdin().read_line(&mut pause)?;
+        return Ok(());
+    }
+
     let gemini_key = get_gemini_key(cfg);
     let downloader = Downloader::new();
     let temp_dir = cache_dir();
@@ -45,6 +58,7 @@ pub async fn download_and_ingest(
         )?;
     }
 
+    println!("\n  {} Processing complete!", "✔".green().bold());
     print!("  Delete item from Seedr cloud to free space? [y/N]: ");
     io::stdout().flush()?;
     let mut del_input = String::new();
