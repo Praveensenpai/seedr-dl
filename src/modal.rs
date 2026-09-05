@@ -13,7 +13,6 @@ pub enum Modal {
     ConfirmCancelTorrent(SeedrTorrent),
     ConfirmCleanAll(usize),
     InputMagnet(String),
-    SelectDownloadMode(SeedrFolder),
 }
 
 pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal) {
@@ -25,7 +24,6 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal) {
         Modal::ConfirmCancelTorrent(torrent) => render_cancel_modal(f, popup_area, torrent),
         Modal::ConfirmCleanAll(count) => render_clean_modal(f, popup_area, *count),
         Modal::InputMagnet(input) => render_magnet_modal(f, popup_area, input),
-        Modal::SelectDownloadMode(folder) => render_mode_modal(f, popup_area, folder),
     }
 }
 
@@ -125,37 +123,6 @@ fn render_magnet_modal(f: &mut Frame, area: Rect, input: &str) {
     .block(
         Block::default()
             .title(" Add Magnet Link ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan)),
-    )
-    .alignment(Alignment::Center);
-    f.render_widget(p, area);
-}
-
-fn render_mode_modal(f: &mut Frame, area: Rect, folder: &SeedrFolder) {
-    let p = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::raw(" Download '"),
-            Span::styled(&folder.name, Style::default().fg(Color::Yellow)),
-            Span::raw("'"),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" [b] / [1] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Background (detached)    "),
-            Span::styled("[f] / [2] ", Style::default().fg(Color::Green)),
-            Span::raw("Foreground (live attach)"),
-        ]),
-        Line::from(vec![
-            Span::styled(" [Esc] ", Style::default().fg(Color::DarkGray)),
-            Span::raw("Cancel"),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .title(" Download Mode ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan)),

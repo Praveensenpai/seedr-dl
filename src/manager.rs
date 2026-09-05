@@ -121,7 +121,10 @@ async fn handle_main_key(
         }
         KeyCode::Enter => {
             if let Some(folder) = state.list.folders.get(state.selected) {
-                state.modal = Some(Modal::SelectDownloadMode(folder.clone()));
+                spawn_worker(folder.id)?;
+                run_attach_loop(term, folder.id).await?;
+                state.local_tasks = list_active_tasks();
+                state.list = client.list_root().await?;
             }
         }
         KeyCode::Char('b') => {
@@ -129,21 +132,21 @@ async fn handle_main_key(
                 spawn_worker(folder.id)?;
                 state.local_tasks = list_active_tasks();
                 state.status = Some((
-                    format!("Started background task for '{}'", folder.name),
+                    format!("Started background download for '{}'", folder.name),
                     false,
                 ));
             }
         }
-        KeyCode::Char('A') => {
+        KeyCode::Char('a' | 'A') => {
             if let Some(first_task) = state.local_tasks.first() {
                 run_attach_loop(term, first_task.folder_id).await?;
                 state.local_tasks = list_active_tasks();
             } else {
-                state.status = Some((
-                    "No active background downloads to attach to.".to_string(),
-                    true,
-                ));
+                state.modal = Some(Modal::InputMagnet(String::new()));
             }
+        }
+        KeyCode::Char('m' | '+') => {
+            state.modal = Some(Modal::InputMagnet(String::new()));
         }
         KeyCode::Char('t') => {
             if let Some(t) = state.list.torrents.first() {
@@ -154,9 +157,6 @@ async fn handle_main_key(
             if let Some(f) = state.list.folders.get(state.selected) {
                 state.modal = Some(Modal::ConfirmDelete(f.clone()));
             }
-        }
-        KeyCode::Char('a') => {
-            state.modal = Some(Modal::InputMagnet(String::new()));
         }
         KeyCode::Char('c') => {
             if !state.list.folders.is_empty() {

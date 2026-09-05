@@ -15,17 +15,19 @@ pub async fn run_attach_loop(
     folder_id: u64,
 ) -> Result<()> {
     while let Some(task) = load_task(folder_id) {
-        if task.status == TaskStatus::Completed || task.status == TaskStatus::Failed {
+        let is_done = task.status == TaskStatus::Completed || task.status == TaskStatus::Failed;
+        term.draw(|f| draw_attach_screen(f, &task))?;
+
+        if is_done {
+            wait_for_dismiss(term)?;
             break;
         }
-
-        term.draw(|f| draw_attach_screen(f, &task))?;
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
-                        KeyCode::Char('b') | KeyCode::Esc => break,
+                        KeyCode::Char('b' | 'd') | KeyCode::Esc => break,
                         KeyCode::Char('x') => {
                             cancel_task(folder_id);
                             break;
@@ -36,6 +38,23 @@ pub async fn run_attach_loop(
             }
         }
     }
+    Ok(())
+}
+
+fn wait_for_dismiss(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    loop {
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'b')
+                )
+            {
+                break;
+            }
+        }
+    }
+    term.clear()?;
     Ok(())
 }
 
@@ -58,9 +77,10 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
     ])])
     .block(
         Block::default()
-            .title(" Live Task Monitor ")
+            .title(" ⚡ Live Download Monitor ")
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan)),
     );
     f.render_widget(title, chunks[0]);
 
@@ -88,10 +108,24 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
     let spd_mb = task.speed_bps as f64 / 1_048_576.0;
     let eta_m = task.eta_seconds / 60;
     let eta_s = task.eta_seconds % 60;
+    let status_str = match task.status {
+        TaskStatus::Downloading => "Downloading from Seedr CDN...".cyan(),
+        TaskStatus::Organizing => "Analyzing with Gemini AI & moving to Jellyfin..."
+            .yellow()
+            .bold(),
+        TaskStatus::Completed => "✔ Ingestion complete! File placed in Jellyfin."
+            .green()
+            .bold(),
+        TaskStatus::Failed => "✖ Ingestion failed.".red().bold(),
+    };
+
     let stats = Paragraph::new(vec![
         Line::from(format!(" Speed:    {spd_mb:.2} MB/s")),
         Line::from(format!(" ETA:      {eta_m}m {eta_s}s remaining")),
-        Line::from(format!(" Status:   {:?}", task.status)),
+        Line::from(vec![
+            Span::raw(" Status:   "),
+            Span::styled(status_str.to_string(), Style::default()),
+        ]),
     ])
     .block(
         Block::default()
@@ -101,17 +135,30 @@ pub fn draw_attach_screen(f: &mut Frame, task: &TaskState) {
     );
     f.render_widget(stats, chunks[2]);
 
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" [b] / [Esc] ", Style::default().fg(Color::Cyan).bold()),
-        Span::raw("Detach (leave downloading in background)      "),
-        Span::styled("[x] ", Style::default().fg(Color::Red).bold()),
-        Span::raw("Cancel download"),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded),
-    )
-    .alignment(Alignment::Center);
+    let footer_text = if task.status == TaskStatus::Completed {
+        Line::from(vec![
+            Span::styled(" [Enter] / [q] ", Style::default().fg(Color::Green).bold()),
+            Span::raw("Return to Manager"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " [b] / [d] / [Esc] ",
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Span::raw("DETACH to background (download continues!)       "),
+            Span::styled("[x] ", Style::default().fg(Color::Red).bold()),
+            Span::raw("Cancel download"),
+        ])
+    };
+
+    let footer = Paragraph::new(footer_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Center);
     f.render_widget(footer, chunks[3]);
 }

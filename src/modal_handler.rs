@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::modal::Modal;
 use crate::organizer::download_and_ingest;
 use crate::seedr::{SeedrClient, SeedrFolder, SeedrTorrent};
-use crate::task::list_active_tasks;
 use crate::ui::AppState;
 use crate::worker::spawn_worker;
 use anyhow::Result;
@@ -25,9 +24,6 @@ pub async fn handle_modal_key(
     code: KeyCode,
 ) -> Result<bool> {
     match modal {
-        Modal::SelectDownloadMode(folder) => {
-            handle_mode_select(state, client, cfg, term, folder, code).await?;
-        }
         Modal::ConfirmDelete(folder) => {
             handle_delete_confirm(state, client, folder, code).await?;
         }
@@ -42,31 +38,6 @@ pub async fn handle_modal_key(
         }
     }
     Ok(false)
-}
-
-async fn handle_mode_select(
-    state: &mut AppState,
-    client: &SeedrClient,
-    cfg: &Config,
-    term: &mut Terminal<CrosstermBackend<Stdout>>,
-    folder: SeedrFolder,
-    code: KeyCode,
-) -> Result<()> {
-    state.modal = None;
-    if matches!(code, KeyCode::Char('b' | '1')) {
-        spawn_worker(folder.id)?;
-        state.local_tasks = list_active_tasks();
-        state.status = Some((
-            format!("Started background task for '{}'", folder.name),
-            false,
-        ));
-    } else if matches!(code, KeyCode::Char('f' | '2') | KeyCode::Enter) {
-        pause_tui()?;
-        download_and_ingest(client, cfg, &folder, false).await?;
-        resume_tui(term)?;
-        state.list = client.list_root().await?;
-    }
-    Ok(())
 }
 
 async fn handle_delete_confirm(

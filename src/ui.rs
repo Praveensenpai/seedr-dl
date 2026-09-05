@@ -214,14 +214,16 @@ fn render_footer(f: &mut Frame, area: Rect, status: Option<&(String, bool)>) {
         }
     } else {
         Line::from(vec![
-            Span::styled(" [↑/k, ↓/j] ", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" [↑/↓] ", Style::default().fg(Color::Cyan).bold()),
             Span::raw("Select   "),
             Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
-            Span::raw("Download   "),
-            Span::styled("[b] ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw("Download & Attach   "),
+            Span::styled("[b] ", Style::default().fg(Color::Yellow).bold()),
             Span::raw("Background   "),
-            Span::styled("[A] ", Style::default().fg(Color::Green).bold()),
+            Span::styled("[a] ", Style::default().fg(Color::Green).bold()),
             Span::raw("Attach   "),
+            Span::styled("[m] ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw("Add   "),
             Span::styled("[d] ", Style::default().fg(Color::Red).bold()),
             Span::raw("Delete   "),
             Span::styled("[q] ", Style::default().dim().bold()),
