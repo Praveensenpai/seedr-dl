@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -74,10 +74,6 @@ pub async fn parse_media(raw_name: &str, api_key: Option<&str>) -> MediaInfo {
 }
 
 async fn query_gemini(raw_name: &str, api_key: &str) -> Result<MediaInfo> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    );
-
     let prompt = format!(
         r#"Analyze this media release filename for a Jellyfin media server: "{raw_name}"
 Return strictly valid JSON with this schema:
@@ -102,20 +98,35 @@ Return strictly valid JSON with this schema:
     };
 
     let client = Client::new();
-    let resp = client.post(&url).json(&req_body).send().await?;
-    let gemini_resp: GeminiResponse = resp.json().await?;
+    for model in ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-1.5-flash"] {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        );
+        let Ok(resp) = client.post(&url).json(&req_body).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(gemini_resp) = resp.json::<GeminiResponse>().await else {
+            continue;
+        };
+        let text_opt = gemini_resp
+            .candidates
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.content)
+            .and_then(|c| c.parts)
+            .and_then(|p| p.into_iter().next())
+            .and_then(|p| p.text);
 
-    let text = gemini_resp
-        .candidates
-        .and_then(|c| c.into_iter().next())
-        .and_then(|c| c.content)
-        .and_then(|c| c.parts)
-        .and_then(|p| p.into_iter().next())
-        .and_then(|p| p.text)
-        .context("No response text from Gemini API")?;
+        if let Some(text) = text_opt {
+            if let Ok(parsed) = serde_json::from_str::<MediaInfo>(&text) {
+                return Ok(parsed);
+            }
+        }
+    }
 
-    let parsed: MediaInfo = serde_json::from_str(&text)?;
-    Ok(parsed)
+    anyhow::bail!("Gemini API models returned error or invalid JSON")
 }
 
 pub fn parse_with_regex(raw_name: &str) -> MediaInfo {
@@ -215,15 +226,23 @@ fn clean_title(s: &str) -> String {
                     | "aac"
                     | "rarbg"
                     | "yts"
+                    | "www"
+                    | "tamilmv"
+                    | "1tamilmv"
+                    | "ing"
             )
         })
         .collect::<Vec<&str>>()
         .join(" ");
 
-    if cleaned.trim().is_empty() {
+    let trimmed = cleaned.trim_matches(|c: char| {
+        c.is_whitespace() || c == '(' || c == ')' || c == '[' || c == ']' || c == '-' || c == '_'
+    });
+
+    if trimmed.is_empty() {
         s.trim().to_string()
     } else {
-        cleaned.trim().to_string()
+        trimmed.to_string()
     }
 }
 
@@ -252,5 +271,16 @@ mod tests {
         assert_eq!(info.episode, Some(5));
         assert_eq!(info.relative_folder, "shows/Breaking Bad/Season 01");
         assert_eq!(info.clean_filename, "Breaking Bad - S01E05.mkv");
+    }
+
+    #[test]
+    fn test_parse_movie_with_site_prefix() {
+        let raw = "www 1TamilMV ing Jana Nayagan ( (2026).mkv";
+        let info = parse_with_regex(raw);
+        assert_eq!(info.media_type, MediaType::Movie);
+        assert_eq!(info.title, "Jana Nayagan");
+        assert_eq!(info.year, Some(2026));
+        assert_eq!(info.relative_folder, "movies/Jana Nayagan (2026)");
+        assert_eq!(info.clean_filename, "Jana Nayagan (2026).mkv");
     }
 }
