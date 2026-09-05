@@ -43,6 +43,10 @@ pub struct SeedrFile {
 #[derive(Debug, Deserialize)]
 pub struct ListContentsResponse {
     #[serde(default)]
+    pub space_max: Option<u64>,
+    #[serde(default)]
+    pub space_used: Option<u64>,
+    #[serde(default)]
     pub torrents: Vec<SeedrTorrent>,
     #[serde(default)]
     pub folders: Vec<SeedrFolder>,
@@ -52,9 +56,12 @@ pub struct ListContentsResponse {
 
 #[derive(Debug, Deserialize)]
 struct GenericResponse {
-    result: serde_json::Value,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
     user_torrent_id: Option<u64>,
     url: Option<String>,
+    reason_phrase: Option<String>,
+    error: Option<String>,
 }
 
 use std::net::SocketAddr;
@@ -131,12 +138,35 @@ impl SeedrClient {
             .context("Failed to add magnet to Seedr")?;
 
         let res: GenericResponse = resp.json().await?;
-        if res.result == true || res.result == "true" {
-            res.user_torrent_id
-                .context("Torrent added but user_torrent_id missing")
-        } else {
-            bail!("Seedr rejected magnet link: {:?}", res.result)
+
+        if let Some(ref reason) = res.reason_phrase {
+            if reason.contains("not_enough_space") {
+                bail!(
+                    "Not enough space in your Seedr cloud account! Run 'seedr-dl' to download and delete existing files, or free space on seedr.cc."
+                );
+            }
+            bail!("Seedr rejected magnet: {reason}");
         }
+
+        if let Some(ref err) = res.error {
+            bail!("Seedr error: {err}");
+        }
+
+        if let Some(id) = res.user_torrent_id {
+            return Ok(id);
+        }
+
+        if res
+            .result
+            .as_ref()
+            .is_some_and(|r| r == true || r == "true")
+        {
+            if let Some(id) = res.user_torrent_id {
+                return Ok(id);
+            }
+        }
+
+        bail!("Seedr rejected magnet: {:?}", res.result)
     }
 
     pub async fn wait_for_caching(

@@ -172,7 +172,16 @@ async fn handle_list(cfg: &Config, non_interactive: bool) -> Result<()> {
     let list = client.list_root().await?;
 
     println!();
-    println!("  {}", "📁 Seedr Cloud Contents:".cyan().bold());
+    if let (Some(used), Some(max)) = (list.space_used, list.space_max) {
+        let used_mb = used / 1_048_576;
+        let max_mb = max / 1_048_576;
+        let free_mb = max_mb.saturating_sub(used_mb);
+        println!(
+            "  {} Cloud Storage: {used_mb} MB / {max_mb} MB used ({free_mb} MB free)",
+            "•".cyan()
+        );
+    }
+
     if list.folders.is_empty() && list.files.is_empty() {
         println!("  {} No completed files in Seedr cloud.", "•".dimmed());
         return Ok(());
@@ -192,12 +201,30 @@ async fn handle_list(cfg: &Config, non_interactive: bool) -> Result<()> {
         println!("  [{}] 📁 {} ({} MB)", idx + 1, f.name.bold(), sz);
     }
 
-    print!("\nEnter item number to download and ingest into Jellyfin (or 0 to cancel): ");
+    print!("\nEnter item to download (or 'd 1' to delete, 0 to cancel): ");
     io::stdout().flush()?;
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
-    let num: usize = choice.trim().parse().unwrap_or(0);
+    let trimmed = choice.trim();
 
+    if let Some(rest) = trimmed
+        .strip_prefix("d ")
+        .or_else(|| trimmed.strip_prefix("rm "))
+    {
+        let idx: usize = rest.trim().parse().unwrap_or(0);
+        if idx > 0 && idx <= list.folders.len() {
+            let folder = &list.folders[idx - 1];
+            client.delete_folder(folder.id).await?;
+            println!(
+                "  {} Deleted '{}' from Seedr cloud.",
+                "✔".green(),
+                folder.name
+            );
+            return Ok(());
+        }
+    }
+
+    let num: usize = trimmed.parse().unwrap_or(0);
     if num > 0 && num <= list.folders.len() {
         let folder = &list.folders[num - 1];
         download_and_organize_folder(&client, cfg, folder, non_interactive).await?;
