@@ -57,24 +57,35 @@ struct GenericResponse {
     url: Option<String>,
 }
 
+use std::net::SocketAddr;
+
 pub struct SeedrClient {
     client: Client,
     token: String,
 }
 
+fn build_seedr_client(timeout_secs: u64) -> Client {
+    let seedr_addr = SocketAddr::from(([95, 211, 204, 172], 443));
+    Client::builder()
+        .resolve("www.seedr.cc", seedr_addr)
+        .resolve("seedr.cc", seedr_addr)
+        .resolve("stream.seedr.cc", seedr_addr)
+        .resolve("direct.seedr.cc", seedr_addr)
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .unwrap_or_default()
+}
+
 impl SeedrClient {
     pub fn new(token: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+            client: build_seedr_client(30),
             token,
         }
     }
 
     pub async fn login(email: &str, pass: &str) -> Result<Auth> {
-        let client = Client::new();
+        let client = build_seedr_client(30);
         let params = [
             ("grant_type", "password"),
             ("client_id", "seedr_chrome"),

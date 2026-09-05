@@ -18,10 +18,17 @@ impl Default for Downloader {
     }
 }
 
+use std::net::SocketAddr;
+
 impl Downloader {
     pub fn new() -> Self {
+        let seedr_addr = SocketAddr::from(([95, 211, 204, 172], 443));
         Self {
             client: Client::builder()
+                .resolve("www.seedr.cc", seedr_addr)
+                .resolve("seedr.cc", seedr_addr)
+                .resolve("stream.seedr.cc", seedr_addr)
+                .resolve("direct.seedr.cc", seedr_addr)
                 .timeout(Duration::from_secs(3600))
                 .build()
                 .unwrap_or_default(),
