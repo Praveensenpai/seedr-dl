@@ -1,5 +1,6 @@
 use crate::modal::{render_modal, Modal};
 use crate::seedr::{ListContentsResponse, SeedrFolder, SeedrTorrent};
+use crate::task::TaskState;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -10,6 +11,7 @@ use ratatui::{
 
 pub struct AppState {
     pub list: ListContentsResponse,
+    pub local_tasks: Vec<TaskState>,
     pub selected: usize,
     pub modal: Option<Modal>,
     pub status: Option<(String, bool)>,
@@ -18,25 +20,25 @@ pub struct AppState {
 pub fn draw_ui(f: &mut Frame, state: &AppState) {
     let size = f.area();
     let has_torrents = !state.list.torrents.is_empty();
+    let has_tasks = !state.local_tasks.is_empty();
 
-    let constraints = if has_torrents {
-        vec![
-            Constraint::Length(4),
-            Constraint::Length(
-                u16::try_from(state.list.torrents.len() + 2)
-                    .unwrap_or(4)
-                    .min(8),
-            ),
-            Constraint::Min(6),
-            Constraint::Length(3),
-        ]
-    } else {
-        vec![
-            Constraint::Length(4),
-            Constraint::Min(6),
-            Constraint::Length(3),
-        ]
-    };
+    let mut constraints = vec![Constraint::Length(4)];
+    if has_torrents {
+        constraints.push(Constraint::Length(
+            u16::try_from(state.list.torrents.len() + 2)
+                .unwrap_or(4)
+                .min(8),
+        ));
+    }
+    if has_tasks {
+        constraints.push(Constraint::Length(
+            u16::try_from(state.local_tasks.len() + 2)
+                .unwrap_or(4)
+                .min(8),
+        ));
+    }
+    constraints.push(Constraint::Min(6));
+    constraints.push(Constraint::Length(3));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -52,6 +54,11 @@ pub fn draw_ui(f: &mut Frame, state: &AppState) {
         idx += 1;
     }
 
+    if has_tasks {
+        render_local_tasks(f, chunks[idx], &state.local_tasks);
+        idx += 1;
+    }
+
     render_folders(f, chunks[idx], &state.list.folders, state.selected);
     idx += 1;
 
@@ -62,6 +69,7 @@ pub fn draw_ui(f: &mut Frame, state: &AppState) {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn render_storage(f: &mut Frame, area: Rect, list: &ListContentsResponse) {
     let (used_mb, max_mb) = match (list.space_used, list.space_max) {
         (Some(u), Some(m)) => (u / 1_048_576, m / 1_048_576),
@@ -69,7 +77,6 @@ fn render_storage(f: &mut Frame, area: Rect, list: &ListContentsResponse) {
     };
     let ratio = if max_mb > 0 {
         // reason: used_mb and max_mb represent megabytes (< 10^7), fitting safely in f64
-        #[allow(clippy::cast_precision_loss)]
         (used_mb as f64 / max_mb as f64).min(1.0)
     } else {
         0.0
@@ -118,6 +125,40 @@ fn render_torrents(f: &mut Frame, area: Rect, torrents: &[SeedrTorrent]) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Yellow)),
+    );
+    f.render_widget(list, area);
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn render_local_tasks(f: &mut Frame, area: Rect, tasks: &[TaskState]) {
+    let items: Vec<ListItem> = tasks
+        .iter()
+        .map(|t| {
+            let pct = if t.total_bytes > 0 {
+                // reason: byte values fit safely in f64
+                (t.downloaded_bytes as f64 / t.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            let dl_mb = t.downloaded_bytes / 1_048_576;
+            let tot_mb = t.total_bytes / 1_048_576;
+            let spd_mb = t.speed_bps as f64 / 1_048_576.0;
+            let eta_m = t.eta_seconds / 60;
+            let eta_s = t.eta_seconds % 60;
+            let content = format!(
+                " 🚀 {} — {} MB / {} MB [{:.1}%] ({:.2} MB/s, ETA {}m{}s)",
+                t.folder_name, dl_mb, tot_mb, pct, spd_mb, eta_m, eta_s
+            );
+            ListItem::new(content).style(Style::default().fg(Color::Green))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Background Ingestion Tasks (press [A] to attach) ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Green)),
     );
     f.render_widget(list, area);
 }
@@ -177,14 +218,12 @@ fn render_footer(f: &mut Frame, area: Rect, status: Option<&(String, bool)>) {
             Span::raw("Select   "),
             Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
             Span::raw("Download   "),
+            Span::styled("[b] ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw("Background   "),
+            Span::styled("[A] ", Style::default().fg(Color::Green).bold()),
+            Span::raw("Attach   "),
             Span::styled("[d] ", Style::default().fg(Color::Red).bold()),
             Span::raw("Delete   "),
-            Span::styled("[a] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Add   "),
-            Span::styled("[c] ", Style::default().fg(Color::Magenta).bold()),
-            Span::raw("Clean   "),
-            Span::styled("[r] ", Style::default().fg(Color::Blue).bold()),
-            Span::raw("Refresh   "),
             Span::styled("[q] ", Style::default().dim().bold()),
             Span::raw("Quit"),
         ])

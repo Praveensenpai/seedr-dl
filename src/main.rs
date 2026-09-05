@@ -1,11 +1,15 @@
+mod attach;
 mod config;
 mod downloader;
 mod gemini;
 mod manager;
 mod modal;
+mod modal_handler;
 mod organizer;
 mod seedr;
+mod task;
 mod ui;
+mod worker;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -19,7 +23,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "seedr-dl")]
 #[command(author = "Praveensenpai <pvnt20@gmail.com>")]
-#[command(version = "0.2.0")]
+#[command(version = "0.3.0")]
 #[command(about = "Seedr Cloud Manager with Gemini AI Ingestion for Jellyfin")]
 struct Cli {
     /// Magnet link or torrent URL to download
@@ -40,6 +44,13 @@ enum Commands {
     Auth,
     /// List files and folders currently in your Seedr cloud
     List,
+    /// View active background downloads
+    Tasks,
+    /// Attach to a running background download
+    Attach {
+        /// Optional folder ID to attach to
+        folder_id: Option<u64>,
+    },
     /// Clean all completed items from your Seedr cloud
     Clean,
     /// Configure Jellyfin path or Gemini API key
@@ -54,6 +65,8 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
+    #[command(hide = true)]
+    Worker { folder_id: u64 },
 }
 
 #[tokio::main]
@@ -62,6 +75,15 @@ async fn main() -> Result<()> {
     let mut cfg = load_config()?;
 
     match cli.command {
+        Some(Commands::Worker { folder_id }) => {
+            worker::run_worker(folder_id).await?;
+        }
+        Some(Commands::Tasks) => {
+            handle_list_tasks();
+        }
+        Some(Commands::Attach { folder_id }) => {
+            handle_cli_attach(folder_id).await?;
+        }
         Some(Commands::Auth) => {
             handle_auth().await?;
         }
@@ -91,6 +113,58 @@ async fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn handle_list_tasks() {
+    let tasks = task::list_active_tasks();
+    if tasks.is_empty() {
+        println!("  No active background ingestion tasks.");
+        return;
+    }
+    println!("  Active Background Ingestion Tasks:");
+    for t in &tasks {
+        let dl_mb = t.downloaded_bytes / 1_048_576;
+        let tot_mb = t.total_bytes / 1_048_576;
+        // reason: byte values fit safely in f64
+        #[allow(clippy::cast_precision_loss)]
+        let pct = if t.total_bytes > 0 {
+            (t.downloaded_bytes as f64 / t.total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        // reason: speed_bps fits safely in f64
+        #[allow(clippy::cast_precision_loss)]
+        let spd = t.speed_bps as f64 / 1_048_576.0;
+        println!(
+            "  • [{}] {} — {}/{} MB ({:.1}%, {:.2} MB/s, ETA {}s)",
+            t.folder_id, t.folder_name, dl_mb, tot_mb, pct, spd, t.eta_seconds
+        );
+    }
+}
+
+async fn handle_cli_attach(folder_id_opt: Option<u64>) -> Result<()> {
+    let tasks = task::list_active_tasks();
+    let folder_id = match folder_id_opt {
+        Some(id) => id,
+        None => {
+            if let Some(first) = tasks.first() {
+                first.folder_id
+            } else {
+                bail!("No active background downloads to attach to.");
+            }
+        }
+    };
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    let mut term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
+    attach::run_attach_loop(&mut term, folder_id).await?;
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
     Ok(())
 }
 
@@ -148,21 +222,25 @@ fn handle_config(
         );
         println!(
             "  • Gemini API key:      {}",
-            cfg.gemini_api_key
-                .as_deref()
-                .unwrap_or("[Not Set - Using Regex]")
+            if cfg.gemini_api_key.is_some() {
+                "Configured".green()
+            } else {
+                "Not set (using offline regex fallback)".yellow()
+            }
         );
         return Ok(());
     }
 
-    if let Some(k) = gemini_key {
-        cfg.gemini_api_key = Some(k.trim().to_string());
-        println!("  {} Gemini API key updated.", "✔".green());
+    if let Some(key) = gemini_key {
+        cfg.gemini_api_key = Some(key);
+        println!("  {} Updated Gemini API key.", "✔".green());
     }
-    if let Some(m) = media_dir {
-        cfg.jellyfin_media_dir = m;
-        println!("  {} Jellyfin media path updated.", "✔".green());
+
+    if let Some(dir) = media_dir {
+        cfg.jellyfin_media_dir = dir;
+        println!("  {} Updated Jellyfin media path.", "✔".green());
     }
+
     save_config(cfg)?;
     Ok(())
 }
