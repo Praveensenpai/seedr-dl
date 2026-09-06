@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 CYAN='\033[0;36m'
 GREEN='\033[1;32m'
@@ -25,26 +25,59 @@ case "${OS}-${ARCH}" in
     exit 1 ;;
 esac
 
-LATEST=$(curl -LsSf "https://api.github.com/repos/Praveensenpai/seedr-dl/releases/latest" \
-  | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+DEST_DIR="${HOME}/.local/bin"
+DEST="${DEST_DIR}/seedr-dl"
 
-BIN_URL="https://github.com/Praveensenpai/seedr-dl/releases/download/${LATEST}/seedr-dl-${LATEST}-${TARGET}"
-DEST="${HOME}/.local/bin/seedr-dl"
+LATEST=$(curl -LsSf "https://api.github.com/repos/Praveensenpai/seedr-dl/releases/latest" 2>/dev/null \
+  | grep '"tag_name":' | head -1 | cut -d'"' -f4 || true)
 
-echo -e "${CYAN}  • Latest release : ${BOLD}${LATEST}${RESET}"
-echo -e "${CYAN}  • Target          : ${TARGET}${RESET}"
-echo -e "${CYAN}  • Installing to   : ${DEST}${RESET}\n"
-
-mkdir -p "$(dirname "${DEST}")"
-
-if curl -LsSf -H 'Cache-Control: no-cache' "${BIN_URL}" -o "${DEST}.tmp"; then
-  chmod +x "${DEST}.tmp"
-  mv -f "${DEST}.tmp" "${DEST}"
-  echo -e "${GREEN}✔ seedr-dl ${LATEST} installed!${RESET}"
-else
-  echo -e "${RED}✖ Download failed. Check your connection or try: cargo install --git https://github.com/Praveensenpai/seedr-dl${RESET}"
+if [ -z "${LATEST}" ]; then
+  echo -e "${RED}✖ Could not fetch latest release from GitHub API.${RESET}"
   exit 1
 fi
+
+echo -e "${CYAN}  • Latest release : ${BOLD}${LATEST}${RESET}"
+echo -e "${CYAN}  • Target         : ${TARGET}${RESET}"
+echo -e "${CYAN}  • Installing to  : ${DEST}${RESET}\n"
+
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT INT TERM
+
+TAR_NAME="seedr-dl-${TARGET}.tar.gz"
+DOWNLOAD_URL="https://github.com/Praveensenpai/seedr-dl/releases/download/${LATEST}/${TAR_NAME}"
+FALLBACK_URL="https://github.com/Praveensenpai/seedr-dl/releases/download/${LATEST}/seedr-dl-${LATEST}-${TARGET}.tar.gz"
+
+echo -e "${CYAN}  • Downloading...${RESET}"
+if curl -LsSf -H 'Cache-Control: no-cache' "${DOWNLOAD_URL}" -o "${TMP_DIR}/archive.tar.gz" 2>/dev/null; then
+  echo -e "${CYAN}  • Extracting...${RESET}"
+  tar -xzf "${TMP_DIR}/archive.tar.gz" -C "${TMP_DIR}"
+elif curl -LsSf -H 'Cache-Control: no-cache' "${FALLBACK_URL}" -o "${TMP_DIR}/archive.tar.gz" 2>/dev/null; then
+  echo -e "${CYAN}  • Extracting...${RESET}"
+  tar -xzf "${TMP_DIR}/archive.tar.gz" -C "${TMP_DIR}"
+else
+  # Fallback to direct raw binary if release only has uncompressed binary
+  RAW_URL="https://github.com/Praveensenpai/seedr-dl/releases/download/${LATEST}/seedr-dl-${LATEST}-${TARGET}"
+  if curl -LsSf -H 'Cache-Control: no-cache' "${RAW_URL}" -o "${TMP_DIR}/seedr-dl" 2>/dev/null; then
+    :
+  else
+    echo -e "${RED}✖ Download failed. Check your connection or try: cargo install --git https://github.com/Praveensenpai/seedr-dl${RESET}"
+    exit 1
+  fi
+fi
+
+if [ ! -f "${TMP_DIR}/seedr-dl" ]; then
+  echo -e "${RED}✖ Failed to find 'seedr-dl' executable inside extracted archive.${RESET}"
+  exit 1
+fi
+
+mkdir -p "${DEST_DIR}"
+chmod +x "${TMP_DIR}/seedr-dl"
+mv -f "${TMP_DIR}/seedr-dl" "${DEST}"
+
+echo -e "${GREEN}✔ seedr-dl ${LATEST} installed!${RESET}"
 
 # Ensure ~/.local/bin is on PATH
 if ! echo "${PATH}" | grep -q "${HOME}/.local/bin"; then
