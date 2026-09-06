@@ -2,26 +2,81 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - "v*"
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  # Step 1: Create the release once (not per-matrix)
-  create-release:
-    name: Create Release
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "seedr-dl-release-${{ matrix.target }}"
+          save-if: true
+
+      - name: Install musl tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package release archive (.tar.gz)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/seedr-dl staging/
+          cd staging
+          tar -czf ../seedr-dl-${{ matrix.target }}.tar.gz seedr-dl
+          cd ..
+
+      - name: Upload artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: seedr-dl-${{ matrix.target }}.tar.gz
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create.outputs.upload_url }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
       - name: Create GitHub Release
-        id: create
         uses: softprops/action-gh-release@v2
         with:
           name: ⚡ seedr-dl ${{ github.ref_name }}
@@ -49,45 +104,6 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
-
-  # Step 2: Build binaries in parallel and attach to release
-  build:
-    name: Build (${{ matrix.target }})
-    needs: create-release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: macos-latest
-            target: aarch64-apple-darwin
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl tools (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y musl-tools
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package release archive (.tar.gz)
-        run: |
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/seedr-dl staging/
-          cd staging
-          tar -czf ../seedr-dl-${{ matrix.target }}.tar.gz seedr-dl
-          cd ..
-
-      - name: Attach archive to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: seedr-dl-${{ matrix.target }}.tar.gz
+          files: artifacts/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
