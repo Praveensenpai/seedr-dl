@@ -1,6 +1,7 @@
 //! Background download task persistence and process lifecycle tracking.
 
 use anyhow::Result;
+use colored::Colorize;
 use seedr_dl::config::cache_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -9,6 +10,8 @@ use std::path::PathBuf;
 /// Status of an asynchronous ingestion task.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskStatus {
+    /// Caching torrent into Seedr cloud.
+    Caching,
     /// In progress downloading chunks.
     Downloading,
     /// Organizing media into Jellyfin library.
@@ -18,6 +21,7 @@ pub enum TaskStatus {
     /// Encountered fatal error.
     Failed,
 }
+
 
 /// Persistent record of an active background ingestion worker.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -120,4 +124,94 @@ pub fn cancel_task(folder_id: u64) {
 pub fn is_process_alive(pid: u32) -> bool {
     let proc_path = format!("/proc/{pid}");
     std::path::Path::new(&proc_path).exists()
+}
+
+/// Registers an initial caching task record on disk.
+pub fn register_caching_task(torrent_id: u64, name: &str) {
+    let task = TaskState {
+        folder_id: torrent_id,
+        pid: std::process::id(),
+        folder_name: name.to_string(),
+        file_name: name.to_string(),
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        speed_bps: 0,
+        eta_seconds: 0,
+        status: TaskStatus::Caching,
+        error: None,
+    };
+    let _ = save_task(&task);
+}
+
+/// Updates progress of an active cloud caching task.
+pub fn update_caching_progress(torrent_id: u64, torrent: &seedr_dl::SeedrTorrent) {
+    let total = torrent.size.unwrap_or(0);
+    let pct = torrent.progress.unwrap_or(0.0);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let downloaded = if total > 0 && pct > 0.0 {
+        ((pct / 100.0) * (total as f64)) as u64
+    } else {
+        0
+    };
+    let speed = torrent.download_rate.unwrap_or(0);
+    let eta = if speed > 0 && total > downloaded {
+        (total - downloaded) / speed
+    } else {
+        0
+    };
+    let task = TaskState {
+        folder_id: torrent_id,
+        pid: std::process::id(),
+        folder_name: torrent.name.clone(),
+        file_name: torrent.name.clone(),
+        downloaded_bytes: downloaded,
+        total_bytes: total,
+        speed_bps: speed,
+        eta_seconds: eta,
+        status: TaskStatus::Caching,
+        error: None,
+    };
+    let _ = save_task(&task);
+}
+
+/// Prints active background ingestion tasks to stdout.
+pub fn print_active_tasks(json: bool) {
+    let tasks = list_active_tasks();
+    if json {
+        if let Ok(out) = serde_json::to_string_pretty(&tasks) {
+            println!("{out}");
+        }
+        return;
+    }
+    if tasks.is_empty() {
+        println!("  No active background ingestion tasks.");
+        return;
+    }
+    println!("  {}", "Active Background Ingestion Tasks:".cyan().bold());
+    for t in &tasks {
+        let dl_mb = t.downloaded_bytes / 1_048_576;
+        let tot_mb = t.total_bytes / 1_048_576;
+        let (pct_whole, pct_dec) = t
+            .downloaded_bytes
+            .saturating_mul(1000)
+            .checked_div(t.total_bytes)
+            .map_or((0, 0), |x10| (x10 / 10, x10 % 10));
+        let kbytes_per_sec = t.speed_bps / 1024;
+        let (mb_whole, mb_frac) = (kbytes_per_sec / 1024, (kbytes_per_sec % 1024) * 100 / 1024);
+        let tag = match t.status {
+            TaskStatus::Caching => colored::Colorize::yellow("Caching"),
+            TaskStatus::Downloading => colored::Colorize::cyan("Downloading"),
+            TaskStatus::Organizing => colored::Colorize::magenta("Organizing"),
+            TaskStatus::Completed => colored::Colorize::green("Completed"),
+            TaskStatus::Failed => colored::Colorize::red("Failed"),
+        };
+        println!(
+            "  • [{}] [{tag}] {} — {dl_mb}/{tot_mb} MB ({pct_whole}.{pct_dec}%, {mb_whole}.{mb_frac:02} MB/s, ETA {}s)",
+            t.folder_id, t.folder_name, t.eta_seconds
+        );
+    }
 }

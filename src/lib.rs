@@ -11,7 +11,8 @@ pub use config::{interactive_auth, load_auth, load_config, save_auth, save_confi
 pub use downloader::Downloader;
 pub use notifier::{EventCallback, NotificationEvent, Notifier, NotifierConfig};
 pub use seedr::{
-    extract_magnet_name, ListContentsResponse, SeedrClient, SeedrFile, SeedrFolder, SeedrTorrent,
+    extract_magnet_name, CachingQuery, ListContentsResponse, SeedrClient, SeedrFile, SeedrFolder,
+    SeedrTorrent,
 };
 pub use transfer::{
     collect_folder_files, download_folder as transfer_download_folder, resolve_destination,
@@ -83,9 +84,12 @@ pub async fn download_magnet(
     }
 
     let torrent_id = client.add_magnet(magnet).await?;
-    let folder_opt = client
-        .wait_for_caching(torrent_id, name_hint.as_deref(), &prev_ids)
-        .await?;
+    let query = CachingQuery {
+        torrent_id,
+        name: name_hint.as_deref(),
+        previous_folders: &prev_ids,
+    };
+    let folder_opt = client.wait_for_caching(&query, None).await?;
 
     let Some(folder) = folder_opt else {
         let msg = "Could not find completed folder in Seedr cloud".to_string();

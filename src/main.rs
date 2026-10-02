@@ -7,11 +7,10 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use seedr_dl::config::{load_auth, load_config, save_config, Config};
 use seedr_dl::notifier::{NotificationEvent, Notifier, NotifierConfig};
-use seedr_dl::seedr::{ListContentsResponse, SeedrClient, SeedrFolder};
+use seedr_dl::seedr::{CachingQuery, ListContentsResponse, SeedrClient, SeedrFolder, SeedrTorrent};
 use seedr_dl::transfer::TransferOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use task::list_active_tasks;
 
 #[derive(Parser)]
 #[command(name = "seedr-dl")]
@@ -111,7 +110,7 @@ async fn main() -> Result<()> {
             output_dir,
         }) => worker::run_worker(folder_id, callback_url, output_dir).await,
         Some(Commands::Tasks) => {
-            handle_list_tasks(cli.json);
+            task::print_active_tasks(cli.json);
             Ok(())
         }
         Some(Commands::Cancel { folder_id }) => {
@@ -260,10 +259,24 @@ impl DownloadCtx<'_> {
                 let _ = self.client.delete_torrent(t.id).await;
             }
             let torrent_id = self.client.add_magnet(target).await?;
-            self.client
-                .wait_for_caching(torrent_id, name_hint.as_deref(), &prev_ids)
-                .await?
-                .context("Could not find completed folder in Seedr cloud")?
+            let display_name = name_hint.clone().unwrap_or_else(|| format!("torrent-{torrent_id}"));
+            task::register_caching_task(torrent_id, &display_name);
+
+            let mut on_progress = |t: &SeedrTorrent| {
+                task::update_caching_progress(torrent_id, t);
+            };
+
+            let query = CachingQuery {
+                torrent_id,
+                name: name_hint.as_deref(),
+                previous_folders: &prev_ids,
+            };
+            let folder_res = self
+                .client
+                .wait_for_caching(&query, Some(&mut on_progress))
+                .await;
+            task::remove_task(torrent_id);
+            folder_res?.context("Could not find completed folder in Seedr cloud")?
         };
 
         self.dispatch(&folder, bg).await
@@ -327,39 +340,6 @@ async fn handle_clean(non_interactive: bool) -> Result<()> {
     client.delete_all_folders(&list.folders).await?;
     println!("  {} All completed cloud folders deleted.", "✔".green());
     Ok(())
-}
-
-fn handle_list_tasks(json: bool) {
-    let tasks = list_active_tasks();
-    if json {
-        if let Ok(out) = serde_json::to_string_pretty(&tasks) {
-            println!("{out}");
-        }
-        return;
-    }
-    if tasks.is_empty() {
-        println!("  No active background ingestion tasks.");
-        return;
-    }
-    println!("  {}", "Active Background Ingestion Tasks:".cyan().bold());
-    for t in &tasks {
-        let dl_mb = t.downloaded_bytes / 1_048_576;
-        let tot_mb = t.total_bytes / 1_048_576;
-        // reason: byte values safely cast to f64 for ratio calculation
-        #[allow(clippy::cast_precision_loss)]
-        let pct = if t.total_bytes > 0 {
-            (t.downloaded_bytes as f64 / t.total_bytes as f64) * 100.0
-        } else {
-            0.0
-        };
-        // reason: speed_bps fits safely in f64
-        #[allow(clippy::cast_precision_loss)]
-        let spd = t.speed_bps as f64 / 1_048_576.0;
-        println!(
-            "  • [{}] {} — {dl_mb}/{tot_mb} MB ({pct:.1}%, {spd:.2} MB/s, ETA {}s)",
-            t.folder_id, t.folder_name, t.eta_seconds
-        );
-    }
 }
 
 async fn get_authenticated_client() -> Result<SeedrClient> {

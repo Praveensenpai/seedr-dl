@@ -21,58 +21,54 @@ struct TokenResponse {
 /// Active torrent being downloaded/cached in Seedr cloud.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeedrTorrent {
-    /// Unique identifier for torrent.
     pub id: u64,
-    /// Release name of torrent.
     pub name: String,
-    /// Cache progress percentage.
     pub progress: Option<f64>,
-    /// File size in bytes.
     pub size: Option<u64>,
+    #[serde(default)]
+    pub download_rate: Option<u64>,
+    #[serde(default)]
+    pub seeders: Option<u32>,
 }
 
 /// Completed cloud folder stored in Seedr account.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeedrFolder {
-    /// Folder identifier.
     pub id: u64,
-    /// Folder display name.
     pub name: String,
-    /// Folder size in bytes.
     pub size: Option<u64>,
 }
 
 /// Individual file inside a Seedr cloud folder.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeedrFile {
-    /// File ID.
     pub id: Option<u64>,
-    /// Specific folder file ID for direct downloads.
     pub folder_file_id: Option<u64>,
-    /// File name.
     pub name: String,
-    /// Size in bytes.
     pub size: u64,
 }
 
 /// Response returned from listing folder or root cloud contents.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListContentsResponse {
-    /// Maximum storage available on account.
     #[serde(default)]
     pub space_max: Option<u64>,
-    /// Total storage used on account.
     #[serde(default)]
     pub space_used: Option<u64>,
-    /// Active caching torrents.
     #[serde(default)]
     pub torrents: Vec<SeedrTorrent>,
-    /// Completed cloud folders.
     #[serde(default)]
     pub folders: Vec<SeedrFolder>,
-    /// Files inside the requested folder.
     #[serde(default)]
     pub files: Vec<SeedrFile>,
+}
+
+/// Query parameters for waiting for cloud caching.
+#[derive(Debug, Clone)]
+pub struct CachingQuery<'a> {
+    pub torrent_id: u64,
+    pub name: Option<&'a str>,
+    pub previous_folders: &'a [u64],
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,16 +180,6 @@ impl SeedrClient {
             return Ok(id);
         }
 
-        if res
-            .result
-            .as_ref()
-            .is_some_and(|r| r == true || r == "true")
-        {
-            if let Some(id) = res.user_torrent_id {
-                return Ok(id);
-            }
-        }
-
         bail!("Seedr rejected magnet: {:?}", res.result)
     }
 
@@ -203,12 +189,11 @@ impl SeedrClient {
     /// Returns an error if communication with Seedr fails.
     pub async fn wait_for_caching(
         &self,
-        torrent_id: u64,
-        name: Option<&str>,
-        previous_folders: &[u64],
+        query: &CachingQuery<'_>,
+        mut on_progress: Option<&mut (dyn FnMut(&SeedrTorrent) + Send)>,
     ) -> Result<Option<SeedrFolder>> {
         let pb = ProgressBar::new_spinner();
-        let display_name = name.unwrap_or("Torrent");
+        let display_name = query.name.unwrap_or("Torrent");
         pb.set_style(
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
@@ -216,19 +201,29 @@ impl SeedrClient {
         );
         pb.set_message(format!("Seedr cloud caching: {display_name}"));
 
-        let mut resolved_name = name.map(ToString::to_string);
+        let mut resolved_name = query.name.map(ToString::to_string);
+        let mut poll_secs = 5;
+        let mut not_found_attempts = 0;
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(poll_secs)).await;
             let list = self.list_root().await?;
 
-            if let Some(torrent) = list.torrents.iter().find(|t| t.id == torrent_id) {
+            if let Some(torrent) = list.torrents.iter().find(|t| t.id == query.torrent_id) {
+                not_found_attempts = 0;
                 resolved_name = Some(torrent.name.clone());
                 let pct = torrent.progress.unwrap_or(0.0);
-                pb.set_message(format!("Seedr cloud caching: {} ({pct:.1}%)", torrent.name));
+                poll_secs = Self::calculate_adaptive_poll_secs(torrent.download_rate.unwrap_or(0));
+                pb.set_message(format!(
+                    "Seedr cloud caching: {} ({pct:.1}%) [poll: {poll_secs}s]",
+                    torrent.name
+                ));
+                if let Some(ref mut cb) = on_progress {
+                    cb(torrent);
+                }
                 continue;
             }
 
-            if let Some(folder) = list.folders.iter().find(|f| !previous_folders.contains(&f.id)) {
+            if let Some(folder) = list.folders.iter().find(|f| !query.previous_folders.contains(&f.id)) {
                 pb.finish_with_message(format!("{} Seedr cloud caching complete!", "✔".green().bold()));
                 return Ok(Some(folder.clone()));
             }
@@ -244,12 +239,25 @@ impl SeedrClient {
                 }
             }
 
+            not_found_attempts += 1;
+            if not_found_attempts < 12 {
+                poll_secs = 3;
+                continue;
+            }
+
             pb.finish_with_message(format!("{} Ready in Seedr cloud.", "✔".green().bold()));
             return Ok(list.folders.into_iter().next());
         }
     }
 
-
+    const fn calculate_adaptive_poll_secs(rate: u64) -> u64 {
+        match rate {
+            0..=149_999 => 60,
+            150_000..=499_999 => 30,
+            500_000..=1_999_999 => 15,
+            _ => 5,
+        }
+    }
 
     /// Lists the root contents (folders and active torrents) in Seedr cloud.
     ///
@@ -330,8 +338,7 @@ impl SeedrClient {
             .iter()
             .map(|f| format!("{{\"type\":\"folder\",\"id\":{}}}", f.id))
             .collect();
-        let delete_arr = format!("[{}]", items.join(","));
-        self.post_delete(&delete_arr).await
+        self.post_delete(&format!("[{}]", items.join(","))).await
     }
 
     async fn post_delete(&self, delete_arr: &str) -> Result<()> {

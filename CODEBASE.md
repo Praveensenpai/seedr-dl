@@ -79,14 +79,14 @@ CLI / Rust App
   ```
 - **Side Effects / I/O**: Non-blocking tokio mpsc channel, HTTP POST to webhook URLs with rate-limiting.
 
-### `src/seedr.rs` (Role: Seedr API adapter, Lines: ~389)
-- **Responsibility**: Authenticates with Seedr.cc, manages cloud folders/torrents, and fetches download URLs.
-- **Types**: `SeedrTorrent`, `SeedrFolder`, `SeedrFile`, `ListContentsResponse`, `SeedrClient`.
+### `src/seedr.rs` (Role: Seedr API adapter, Lines: ~396)
+- **Responsibility**: Authenticates with Seedr.cc, manages cloud folders/torrents, adaptive polling, and fetches download URLs.
+- **Types**: `SeedrTorrent`, `SeedrFolder`, `SeedrFile`, `CachingQuery`, `ListContentsResponse`, `SeedrClient`.
 - **Public Functions**:
   ```rust
   pub async fn login(email: &str, pass: &str) -> Result<Auth>
   pub async fn add_magnet(&self, magnet: &str) -> Result<u64>
-  pub async fn wait_for_caching(&self, torrent_id: u64, name_hint: Option<&str>, previous_folders: &[u64]) -> Result<Option<SeedrFolder>>
+  pub async fn wait_for_caching(&self, query: &CachingQuery<'_>, on_progress: Option<&mut (dyn FnMut(&SeedrTorrent) + Send)>) -> Result<Option<SeedrFolder>>
   pub async fn list_root(&self) -> Result<ListContentsResponse>
   pub async fn list_folder(&self, folder_id: u64) -> Result<ListContentsResponse>
   pub async fn get_download_url(&self, file_id: u64) -> Result<String>
@@ -115,7 +115,7 @@ CLI / Rust App
   pub async fn download_with_callback<F>(&self, url: &str, target_dir: &Path, file_name: &str, callback: F) -> Result<PathBuf>
   ```
 
-### `src/config.rs` (Role: persistent configuration, Lines: ~160)
+### `src/config.rs` (Role: persistent configuration, Lines: ~173)
 - **Types**: `Config` (`download_dir`, `delete_after_download`, `download_threads`), `Auth` (`access_token`, `refresh_token`).
 - **Functions**: `load_config()`, `save_config()`, `load_auth()`, `save_auth()`, `interactive_auth()`.
 
@@ -128,7 +128,7 @@ CLI / Rust App
 - **Types**: `WorkerSpawnOpts`.
 - **Functions**: `spawn_worker(opts: &WorkerSpawnOpts)`, `run_worker(folder_id: u64, callback_url: Option<String>, output_dir: Option<PathBuf>)`.
 
-### `src/task.rs` (Role: background task state persistence, Lines: ~123)
+### `src/task.rs` (Role: background task state persistence & CLI display, Lines: ~217)
 - **Types**: `TaskState`, `TaskStatus`.
-- **Functions**: `save_task()`, `load_task()`, `remove_task()`, `list_active_tasks()`, `cancel_task()`.
+- **Functions**: `save_task()`, `load_task()`, `remove_task()`, `list_active_tasks()`, `cancel_task()`, `register_caching_task()`, `update_caching_progress()`, `print_active_tasks()`.
 
