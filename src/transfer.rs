@@ -311,5 +311,3 @@ mod tests {
         assert_eq!(dest, PathBuf::from("/downloads/yuru_camp/specials/sp1.mkv"));
     }
 }
-
-

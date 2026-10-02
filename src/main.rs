@@ -246,7 +246,11 @@ impl DownloadCtx<'_> {
         let prev_ids: Vec<u64> = root_before.folders.iter().map(|f| f.id).collect();
         let name_hint = seedr_dl::extract_magnet_name(target);
         let existing = name_hint.as_ref().and_then(|name| {
-            root_before.folders.iter().find(|f| f.name == *name).cloned()
+            root_before
+                .folders
+                .iter()
+                .find(|f| f.name == *name)
+                .cloned()
         });
 
         let folder = if let Some(f) = existing {
@@ -259,7 +263,9 @@ impl DownloadCtx<'_> {
                 let _ = self.client.delete_torrent(t.id).await;
             }
             let torrent_id = self.client.add_magnet(target).await?;
-            let display_name = name_hint.clone().unwrap_or_else(|| format!("torrent-{torrent_id}"));
+            let display_name = name_hint
+                .clone()
+                .unwrap_or_else(|| format!("torrent-{torrent_id}"));
             task::register_caching_task(torrent_id, &display_name);
 
             let mut on_progress = |t: &SeedrTorrent| {
@@ -346,7 +352,10 @@ async fn get_authenticated_client() -> Result<SeedrClient> {
     if let Some(auth) = load_auth()? {
         return Ok(SeedrClient::new(auth.access_token));
     }
-    println!("  {} No active Seedr credentials found. Let's log in!", "•".yellow());
+    println!(
+        "  {} No active Seedr credentials found. Let's log in!",
+        "•".yellow()
+    );
     let auth = seedr_dl::interactive_auth().await?;
     Ok(SeedrClient::new(auth.access_token))
 }

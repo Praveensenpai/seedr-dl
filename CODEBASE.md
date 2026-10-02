@@ -123,9 +123,9 @@ CLI / Rust App
 - **Types**: `HistoryEntry` (`id`, `original_name`, `file_path`, `file_size`, `downloaded_at`).
 - **Functions**: `load_history()`, `save_history()`, `add_history_entry()`, `clear_history()`.
 
-### `src/worker.rs` (Role: background multi-file series runner, Lines: ~318)
-- **Responsibility**: Manages background downloading of entire series/folders recursively with cumulative progress reporting to tasks and webhooks.
-- **Types**: `WorkerSpawnOpts`.
+### `src/worker.rs` (Role: background multi-file series runner, Lines: ~340)
+- **Responsibility**: Manages background downloading of entire series/folders recursively with cumulative progress reporting to tasks and webhooks, resolving accurate series/file names.
+- **Types**: `WorkerSpawnOpts`, `WorkerBatchCtx`, `WorkerExecCtx`.
 - **Functions**: `spawn_worker(opts: &WorkerSpawnOpts)`, `run_worker(folder_id: u64, callback_url: Option<String>, output_dir: Option<PathBuf>)`.
 
 ### `src/task.rs` (Role: background task state persistence & CLI display, Lines: ~217)

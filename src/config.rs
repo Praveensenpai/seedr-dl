@@ -33,7 +33,6 @@ pub struct Config {
     pub download_threads: usize,
 }
 
-
 impl Default for Config {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -134,8 +133,6 @@ pub fn save_auth(auth: &Auth) -> Result<()> {
     fs::write(&path, content)?;
     Ok(())
 }
-
-
 
 /// Interactively prompts the user for Seedr credentials, logs in, and saves auth token.
 ///

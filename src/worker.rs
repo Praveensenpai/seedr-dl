@@ -111,71 +111,81 @@ pub async fn run_worker(
     }
 }
 
-async fn run_worker_internal(
+async fn resolve_worker_folder_name(
+    client: &SeedrClient,
     folder_id: u64,
-    output_dir: Option<&Path>,
-    notifier: &Notifier,
-) -> Result<()> {
-    let cfg = load_config()?;
-    let auth = load_auth()?.context("No auth found. Please run 'seedr-dl auth'")?;
-    let client = SeedrClient::new(auth.access_token);
-
-    let items = seedr_dl::transfer::collect_folder_files(&client, folder_id).await?;
-    if items.is_empty() {
-        anyhow::bail!("No files found in folder {folder_id}");
-    }
-
+    first_file: Option<&str>,
+) -> String {
     let existing_task = crate::task::load_task(folder_id);
-    let folder_name = existing_task
+    let mut name = existing_task
         .as_ref()
-        .map_or_else(|| format!("folder-{folder_id}"), |t| t.folder_name.clone());
+        .map(|t| t.folder_name.clone())
+        .unwrap_or_default();
 
-    let is_multi = items.len() > 1
-        || items
-            .iter()
-            .any(|i| i.relative_path != Path::new(&i.file.name));
+    if name.is_empty() || name.starts_with("folder-") {
+        if let Ok(root) = client.list_root().await {
+            if let Some(f) = root.folders.iter().find(|f| f.id == folder_id) {
+                name = f.name.clone();
+            }
+        }
+    }
+    if (name.is_empty() || name.starts_with("folder-")) && first_file.is_some() {
+        if let Some(first) = first_file {
+            name = first.to_string();
+        }
+    }
+    if name.is_empty() {
+        format!("folder-{folder_id}")
+    } else {
+        name
+    }
+}
 
-    let final_dir = output_dir.unwrap_or(&cfg.download_dir);
-    let total_bytes: u64 = items.iter().map(|i| i.file.size).sum();
+struct WorkerBatchCtx<'a> {
+    client: &'a SeedrClient,
+    folder_id: u64,
+    folder_name: &'a str,
+    final_dir: &'a Path,
+    temp_dir: &'a Path,
+    task: &'a Arc<Mutex<TaskState>>,
+    notifier: &'a Notifier,
+    is_multi: bool,
+    total_bytes: u64,
+}
 
-    let temp_dir = downloads_dir();
-    let _ = fs::create_dir_all(&temp_dir);
-
-    let task = init_worker_task(folder_id, &folder_name, total_bytes);
-    let downloader = Downloader::new(cfg.download_threads);
-    let total_files = items.len();
+async fn download_worker_items(
+    downloader: &Downloader,
+    items: &[seedr_dl::transfer::CloudFileItem],
+    ctx: &WorkerBatchCtx<'_>,
+) -> Result<PathBuf> {
     let mut prior_bytes: u64 = 0;
     let mut last_dest = PathBuf::new();
+    let total_files = items.len();
 
     for (idx, item) in items.iter().enumerate() {
-        let current_num = idx + 1;
         let dest_path = seedr_dl::transfer::resolve_destination(
-            final_dir,
-            &folder_name,
+            ctx.final_dir,
+            ctx.folder_name,
             item,
-            is_multi,
+            ctx.is_multi,
         );
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let file_ctx = WorkerFileCtx {
-            folder_id,
-            folder_name: &folder_name,
-            current_num,
+        let exec_ctx = WorkerExecCtx {
+            task: ctx.task,
+            notifier: ctx.notifier,
+            temp_dir: ctx.temp_dir,
+            folder_id: ctx.folder_id,
+            folder_name: ctx.folder_name,
+            current_num: idx + 1,
             total_files,
             prior_bytes,
-            total_bytes,
+            total_bytes: ctx.total_bytes,
         };
 
-        let exec_ctx = WorkerExecCtx {
-            task: &task,
-            notifier,
-            temp_dir: &temp_dir,
-            file_ctx: &file_ctx,
-        };
-
-        let temp_downloaded = execute_worker_file(&client, &downloader, item, &exec_ctx).await?;
+        let temp_downloaded = execute_worker_file(ctx.client, downloader, item, &exec_ctx).await?;
 
         fs::rename(&temp_downloaded, &dest_path).or_else(|_| {
             fs::copy(&temp_downloaded, &dest_path)?;
@@ -194,6 +204,87 @@ async fn run_worker_internal(
         prior_bytes += item.file.size;
         last_dest = dest_path;
     }
+    Ok(last_dest)
+}
+
+async fn finalize_worker_completion(ctx: &WorkerBatchCtx<'_>, last_dest: &Path) -> Result<()> {
+    let completion_path = if ctx.is_multi {
+        ctx.final_dir.join(ctx.folder_name)
+    } else {
+        last_dest.to_path_buf()
+    };
+
+    let completion_name = if ctx.is_multi {
+        ctx.folder_name.to_string()
+    } else {
+        last_dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(ctx.folder_name)
+            .to_string()
+    };
+
+    ctx.notifier.notify(NotificationEvent::Completed {
+        folder_id: ctx.folder_id,
+        file_name: completion_name,
+        destination_path: Some(completion_path.to_string_lossy().to_string()),
+        total_bytes: ctx.total_bytes,
+    });
+
+    let _ = ctx.client.delete_folder(ctx.folder_id).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    remove_task(ctx.folder_id);
+    Ok(())
+}
+
+async fn run_worker_internal(
+    folder_id: u64,
+    output_dir: Option<&Path>,
+    notifier: &Notifier,
+) -> Result<()> {
+    let cfg = load_config()?;
+    let auth = load_auth()?.context("No auth found. Please run 'seedr-dl auth'")?;
+    let client = SeedrClient::new(auth.access_token);
+
+    let items = seedr_dl::transfer::collect_folder_files(&client, folder_id).await?;
+    if items.is_empty() {
+        anyhow::bail!("No files found in folder {folder_id}");
+    }
+
+    let folder_name = resolve_worker_folder_name(
+        &client,
+        folder_id,
+        items.first().map(|i| i.file.name.as_str()),
+    )
+    .await;
+
+    let is_multi = items.len() > 1
+        || items
+            .iter()
+            .any(|i| i.relative_path != Path::new(&i.file.name));
+
+    let final_dir = output_dir.unwrap_or(&cfg.download_dir);
+    let total_bytes: u64 = items.iter().map(|i| i.file.size).sum();
+
+    let temp_dir = downloads_dir();
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let task = init_worker_task(folder_id, &folder_name, total_bytes);
+    let downloader = Downloader::new(cfg.download_threads);
+
+    let batch_ctx = WorkerBatchCtx {
+        client: &client,
+        folder_id,
+        folder_name: &folder_name,
+        final_dir,
+        temp_dir: &temp_dir,
+        task: &task,
+        notifier,
+        is_multi,
+        total_bytes,
+    };
+
+    let last_dest = download_worker_items(&downloader, &items, &batch_ctx).await?;
 
     if let Ok(mut t) = task.lock() {
         t.status = TaskStatus::Completed;
@@ -201,26 +292,8 @@ async fn run_worker_internal(
         let _ = save_task(&t);
     }
 
-    let completion_path = if is_multi {
-        final_dir.join(&folder_name)
-    } else {
-        last_dest
-    };
-
-    notifier.notify(NotificationEvent::Completed {
-        folder_id,
-        file_name: folder_name,
-        destination_path: Some(completion_path.to_string_lossy().to_string()),
-        total_bytes,
-    });
-
-    let _ = client.delete_folder(folder_id).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    remove_task(folder_id);
-
-    Ok(())
+    finalize_worker_completion(&batch_ctx, &last_dest).await
 }
-
 
 fn init_worker_task(folder_id: u64, folder_name: &str, total_bytes: u64) -> Arc<Mutex<TaskState>> {
     let task = Arc::new(Mutex::new(TaskState {
@@ -241,20 +314,16 @@ fn init_worker_task(folder_id: u64, folder_name: &str, total_bytes: u64) -> Arc<
     }
     task
 }
-struct WorkerFileCtx<'a> {
+struct WorkerExecCtx<'a> {
+    task: &'a Arc<Mutex<TaskState>>,
+    notifier: &'a Notifier,
+    temp_dir: &'a Path,
     folder_id: u64,
     folder_name: &'a str,
     current_num: usize,
     total_files: usize,
     prior_bytes: u64,
     total_bytes: u64,
-}
-
-struct WorkerExecCtx<'a> {
-    task: &'a Arc<Mutex<TaskState>>,
-    notifier: &'a Notifier,
-    temp_dir: &'a Path,
-    file_ctx: &'a WorkerFileCtx<'a>,
 }
 
 async fn execute_worker_file(
@@ -266,10 +335,10 @@ async fn execute_worker_file(
     let file = &item.file;
     let file_id = file.folder_file_id.or(file.id).context("File ID missing")?;
     let download_url = client.get_download_url(file_id).await?;
-    let file_label = if ctx.file_ctx.total_files > 1 {
+    let file_label = if ctx.total_files > 1 {
         format!(
             "{} ({}/{}: {})",
-            ctx.file_ctx.folder_name, ctx.file_ctx.current_num, ctx.file_ctx.total_files, file.name
+            ctx.folder_name, ctx.current_num, ctx.total_files, file.name
         )
     } else {
         file.name.clone()
@@ -277,10 +346,10 @@ async fn execute_worker_file(
 
     let task_cb = Arc::clone(ctx.task);
     let notifier_clone = ctx.notifier.clone();
-    let folder_id = ctx.file_ctx.folder_id;
+    let folder_id = ctx.folder_id;
     let label_clone = file_label;
-    let prior_bytes = ctx.file_ctx.prior_bytes;
-    let total_bytes = ctx.file_ctx.total_bytes;
+    let prior_bytes = ctx.prior_bytes;
+    let total_bytes = ctx.total_bytes;
 
     downloader
         .download_with_callback(

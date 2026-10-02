@@ -3,7 +3,7 @@
 > **High-speed Seedr.cc automation engine, multi-threaded parallel chunk downloader, and webhook notifier with Gemini AI Jellyfin ingestion.**
 
 [![GitHub release](https://img.shields.io/github/v/release/Praveensenpai/seedr-dl?style=flat-square&color=388bfd)](https://github.com/Praveensenpai/seedr-dl/releases/latest)
-[![Crates.io](https://img.shields.io/badge/crates.io-v0.0.8-orange?style=flat-square)](https://crates.io)
+[![Crates.io](https://img.shields.io/badge/crates.io-v0.0.12-orange?style=flat-square)](https://crates.io)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Rust: 2021](https://img.shields.io/badge/rust-2021-purple?style=flat-square)](https://www.rust-lang.org)
 

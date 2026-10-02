@@ -223,20 +223,18 @@ impl SeedrClient {
                 continue;
             }
 
-            if let Some(folder) = list.folders.iter().find(|f| !query.previous_folders.contains(&f.id)) {
-                pb.finish_with_message(format!("{} Seedr cloud caching complete!", "✔".green().bold()));
+            let is_match = |f: &SeedrFolder| {
+                !query.previous_folders.contains(&f.id)
+                    || resolved_name.as_ref().is_some_and(|target| {
+                        f.name == *target || f.name.contains(target) || target.contains(&f.name)
+                    })
+            };
+            if let Some(folder) = list.folders.iter().find(|f| is_match(f)) {
+                pb.finish_with_message(format!(
+                    "{} Seedr cloud caching complete!",
+                    "✔".green().bold()
+                ));
                 return Ok(Some(folder.clone()));
-            }
-
-            if let Some(ref target_name) = resolved_name {
-                if let Some(folder) = list
-                    .folders
-                    .iter()
-                    .find(|f| f.name == *target_name || f.name.contains(target_name) || target_name.contains(&f.name))
-                {
-                    pb.finish_with_message(format!("{} Seedr cloud caching complete!", "✔".green().bold()));
-                    return Ok(Some(folder.clone()));
-                }
             }
 
             not_found_attempts += 1;
@@ -390,7 +388,9 @@ mod tests {
     fn test_seedr_not_enough_space_response() -> Result<(), Box<dyn std::error::Error>> {
         let json = r#"{"result":false,"reason_phrase":"not_enough_space_added_to_wishlist"}"#;
         let res: GenericResponse = serde_json::from_str(json)?;
-        assert!(res.reason_phrase.is_some_and(|r| r.contains("not_enough_space")));
+        assert!(res
+            .reason_phrase
+            .is_some_and(|r| r.contains("not_enough_space")));
         Ok(())
     }
 }

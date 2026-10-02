@@ -22,7 +22,6 @@ pub enum TaskStatus {
     Failed,
 }
 
-
 /// Persistent record of an active background ingestion worker.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TaskState {
