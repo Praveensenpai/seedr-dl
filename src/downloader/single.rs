@@ -12,6 +12,9 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 /// Downloads file over a single HTTP stream (resumes if supported).
+///
+/// # Errors
+/// Returns an error if directory creation, network stream reading, or file writing fails.
 pub async fn download_single(
     client: &Client,
     target: &DownloadTarget<'_>,

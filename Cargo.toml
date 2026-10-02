@@ -1,9 +1,9 @@
 [package]
 name = "seedr-dl"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 authors = ["Praveensenpai <pvnt20@gmail.com>"]
-description = "Pure Rust Seedr.cc downloader with Gemini AI renaming for Jellyfin"
+description = "Pure Rust CLI and library for Seedr.cc with webhooks and multi-chunk streaming"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
@@ -14,11 +14,16 @@ serde_json = "1.0"
 indicatif = "0.17"
 colored = "2.1"
 anyhow = "1.0"
-regex = "1.11"
 futures-util = "0.3"
-crossterm = "0.28"
-ratatui = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[lib]
+name = "seedr_dl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seedr-dl"
+path = "src/main.rs"
 
 [lints.rust]
 unused = "deny"

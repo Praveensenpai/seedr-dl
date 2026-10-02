@@ -22,6 +22,9 @@ pub struct ChunkJob {
 }
 
 /// Downloads a chunk with up to 5 retries and exponential backoff.
+///
+/// # Errors
+/// Returns an error if the chunk transfer exceeds retry limits or the operation is aborted.
 pub async fn download_chunk_with_retry(
     job: ChunkJob,
     state: Arc<Mutex<DownloadState>>,

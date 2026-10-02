@@ -1,5 +1,6 @@
+//! Download history persistence and lookup.
+
 use crate::config::config_dir;
-use crate::gemini::MediaType;
 use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -7,51 +8,29 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Status of how media was renamed and structured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RenameStatus {
-    /// Renamed using Gemini AI.
-    Gemini,
-    /// Renamed using offline regex parser.
-    RegexFallback,
-    /// Manually renamed by user.
-    Manual,
-}
-
-/// A record of a completed ingestion stored in ~/.config/seedr-dl/history.json
+/// A record of a completed download stored in ~/.config/seedr-dl/history.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     /// Unique identifier for this download record.
     pub id: String,
-    /// Original torrent / file name from Seedr.
+    /// Original file name from Seedr.
     pub original_name: String,
-    /// Cleaned canonical title.
-    pub clean_title: String,
-    /// Current path on disk in Jellyfin media library.
+    /// Final saved path on disk.
     pub file_path: PathBuf,
     /// Total file size in bytes.
     pub file_size: u64,
-    /// Type of media (Movie or Show).
-    pub media_type: MediaType,
-    /// Release year if identified.
-    pub year: Option<u32>,
-    /// TV season number if identified.
-    pub season: Option<u32>,
-    /// TV episode number if identified.
-    pub episode: Option<u32>,
     /// Human-readable download timestamp.
     pub downloaded_at: String,
-    /// Whether AI, regex, or manual renaming was used.
-    pub rename_status: RenameStatus,
 }
 
 /// Returns the file path for the history database.
+#[must_use]
 pub fn history_path() -> PathBuf {
     config_dir().join("history.json")
 }
 
 /// Generates a unique, timestamp-based ID for history entries.
+#[must_use]
 pub fn generate_id() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -60,11 +39,15 @@ pub fn generate_id() -> String {
 }
 
 /// Returns formatted current local date and time string.
+#[must_use]
 pub fn current_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Loads all history entries from disk.
+///
+/// # Errors
+/// Returns an error if reading or parsing the history database fails.
 pub fn load_history() -> Result<Vec<HistoryEntry>> {
     let path = history_path();
     if !path.exists() {
@@ -81,6 +64,9 @@ pub fn load_history() -> Result<Vec<HistoryEntry>> {
 }
 
 /// Saves history entries to disk.
+///
+/// # Errors
+/// Returns an error if directory creation or file writing fails.
 pub fn save_history(entries: &[HistoryEntry]) -> Result<()> {
     let path = history_path();
     if let Some(parent) = path.parent() {
@@ -92,7 +78,18 @@ pub fn save_history(entries: &[HistoryEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Clears all history entries from disk.
+///
+/// # Errors
+/// Returns an error if saving the empty history fails.
+pub fn clear_history() -> Result<()> {
+    save_history(&[])
+}
+
 /// Adds a new entry to history and saves to disk.
+///
+/// # Errors
+/// Returns an error if saving history fails.
 pub fn add_history_entry(entry: HistoryEntry) -> Result<()> {
     let mut entries = load_history()?;
     entries.retain(|e| e.id != entry.id);
@@ -100,40 +97,8 @@ pub fn add_history_entry(entry: HistoryEntry) -> Result<()> {
     save_history(&entries)
 }
 
-/// Updates an existing history entry by matching its ID.
-pub fn update_history_entry(entry: &HistoryEntry) -> Result<()> {
-    let mut entries = load_history()?;
-    if let Some(existing) = entries.iter_mut().find(|e| e.id == entry.id) {
-        *existing = entry.clone();
-        save_history(&entries)?;
-    }
-    Ok(())
-}
-
-/// Removes a history entry by ID and saves to disk.
-pub fn remove_history_entry(id: &str) -> Result<Option<HistoryEntry>> {
-    let mut entries = load_history()?;
-    let removed = entries
-        .iter()
-        .position(|e| e.id == id)
-        .map(|idx| entries.remove(idx));
-    if removed.is_some() {
-        save_history(&entries)?;
-    }
-    Ok(removed)
-}
-
-/// Finds a history entry by full ID or prefix match.
-pub fn find_history_entry(query: &str) -> Result<Option<HistoryEntry>> {
-    let entries = load_history()?;
-    let trimmed = query.trim();
-    let found = entries
-        .into_iter()
-        .find(|e| e.id == trimmed || e.id.starts_with(trimmed));
-    Ok(found)
-}
-
 /// Checks if target file actually exists on disk.
+#[must_use]
 pub fn media_file_exists(path: &Path) -> bool {
     path.is_file()
 }
@@ -153,15 +118,9 @@ mod tests {
         let entry = HistoryEntry {
             id: "dl_123".to_string(),
             original_name: "test.mkv".to_string(),
-            clean_title: "Test".to_string(),
             file_path: PathBuf::from("/tmp/test.mkv"),
             file_size: 1024,
-            media_type: MediaType::Movie,
-            year: Some(2025),
-            season: None,
-            episode: None,
             downloaded_at: "2026-09-06 00:00".to_string(),
-            rename_status: RenameStatus::Gemini,
         };
         let Ok(json) = serde_json::to_string(&entry) else {
             panic!("serialization failed");
@@ -169,7 +128,7 @@ mod tests {
         let Ok(deserialized): Result<HistoryEntry, _> = serde_json::from_str(&json) else {
             panic!("deserialization failed");
         };
-        assert_eq!(deserialized.clean_title, "Test");
-        assert_eq!(deserialized.rename_status, RenameStatus::Gemini);
+        assert_eq!(deserialized.original_name, "test.mkv");
+        assert_eq!(deserialized.file_size, 1024);
     }
 }

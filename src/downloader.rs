@@ -66,6 +66,9 @@ impl Downloader {
     }
 
     /// Downloads file displaying a CLI progress bar.
+    ///
+    /// # Errors
+    /// Returns an error if the server is unreachable or the file cannot be written.
     pub async fn download(&self, url: &str, target_dir: &Path, file_name: &str) -> Result<PathBuf> {
         let (total_size, _) = self.probe_download(url).await?;
         let pb = create_progress_bar(total_size, file_name)?;
@@ -93,6 +96,9 @@ impl Downloader {
     }
 
     /// Downloads file streaming progress to the supplied callback.
+    ///
+    /// # Errors
+    /// Returns an error if connection fails, probing fails, or chunk transfer errors.
     pub async fn download_with_callback<F>(
         &self,
         url: &str,

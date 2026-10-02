@@ -3,7 +3,8 @@ use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 const SEEDR_TOKEN_URL: &str = "https://www.seedr.cc/oauth_test/token.php";
@@ -17,39 +18,59 @@ struct TokenResponse {
     error_description: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// Active torrent being downloaded/cached in Seedr cloud.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeedrTorrent {
+    /// Unique identifier for torrent.
     pub id: u64,
+    /// Release name of torrent.
     pub name: String,
+    /// Cache progress percentage.
     pub progress: Option<f64>,
+    /// File size in bytes.
     pub size: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// Completed cloud folder stored in Seedr account.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeedrFolder {
+    /// Folder identifier.
     pub id: u64,
+    /// Folder display name.
     pub name: String,
+    /// Folder size in bytes.
     pub size: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// Individual file inside a Seedr cloud folder.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeedrFile {
+    /// File ID.
     pub id: Option<u64>,
+    /// Specific folder file ID for direct downloads.
     pub folder_file_id: Option<u64>,
+    /// File name.
     pub name: String,
+    /// Size in bytes.
     pub size: u64,
 }
 
-#[derive(Debug, Deserialize)]
+/// Response returned from listing folder or root cloud contents.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListContentsResponse {
+    /// Maximum storage available on account.
     #[serde(default)]
     pub space_max: Option<u64>,
+    /// Total storage used on account.
     #[serde(default)]
     pub space_used: Option<u64>,
+    /// Active caching torrents.
     #[serde(default)]
     pub torrents: Vec<SeedrTorrent>,
+    /// Completed cloud folders.
     #[serde(default)]
     pub folders: Vec<SeedrFolder>,
+    /// Files inside the requested folder.
     #[serde(default)]
     pub files: Vec<SeedrFile>,
 }
@@ -64,8 +85,7 @@ struct GenericResponse {
     error: Option<String>,
 }
 
-use std::net::SocketAddr;
-
+/// Client interacting with the Seedr.cc API.
 pub struct SeedrClient {
     client: Client,
     token: String,
@@ -84,6 +104,8 @@ fn build_seedr_client(timeout_secs: u64) -> Client {
 }
 
 impl SeedrClient {
+    /// Creates a new `SeedrClient` with the given access token.
+    #[must_use]
     pub fn new(token: String) -> Self {
         Self {
             client: build_seedr_client(30),
@@ -91,6 +113,10 @@ impl SeedrClient {
         }
     }
 
+    /// Authenticates with Seedr.cc using email and password.
+    ///
+    /// # Errors
+    /// Returns an error if the network request fails or credentials are rejected.
     pub async fn login(email: &str, pass: &str) -> Result<Auth> {
         let client = build_seedr_client(30);
         let params = [
@@ -122,6 +148,10 @@ impl SeedrClient {
         })
     }
 
+    /// Adds a magnet link to the user's Seedr account.
+    ///
+    /// # Errors
+    /// Returns an error if Seedr rejects the magnet or has insufficient space.
     pub async fn add_magnet(&self, magnet: &str) -> Result<u64> {
         let params = [
             ("func", "add_torrent"),
@@ -141,9 +171,7 @@ impl SeedrClient {
 
         if let Some(ref reason) = res.reason_phrase {
             if reason.contains("not_enough_space") {
-                bail!(
-                    "Not enough space in your Seedr cloud account! Run 'seedr-dl' to download and delete existing files, or free space on seedr.cc."
-                );
+                bail!("Not enough space in your Seedr cloud account! Free space on seedr.cc.");
             }
             bail!("Seedr rejected magnet: {reason}");
         }
@@ -169,53 +197,64 @@ impl SeedrClient {
         bail!("Seedr rejected magnet: {:?}", res.result)
     }
 
+    /// Polls until the torrent finishes caching into a folder on Seedr cloud.
+    ///
+    /// # Errors
+    /// Returns an error if communication with Seedr fails.
     pub async fn wait_for_caching(
         &self,
         torrent_id: u64,
-        name: &str,
+        name: Option<&str>,
+        previous_folders: &[u64],
     ) -> Result<Option<SeedrFolder>> {
         let pb = ProgressBar::new_spinner();
+        let display_name = name.unwrap_or("Torrent");
         pb.set_style(
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
                 .template("{spinner:.cyan} {msg}")?,
         );
-        pb.set_message(format!("Seedr cloud caching: {name}"));
+        pb.set_message(format!("Seedr cloud caching: {display_name}"));
 
+        let mut resolved_name = name.map(ToString::to_string);
         loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             let list = self.list_root().await?;
 
-            if let Some(folder) = list.folders.iter().find(|f| f.name == name) {
-                pb.finish_with_message(format!(
-                    "{} Seedr cloud caching complete!",
-                    "✔".green().bold()
-                ));
+            if let Some(torrent) = list.torrents.iter().find(|t| t.id == torrent_id) {
+                resolved_name = Some(torrent.name.clone());
+                let pct = torrent.progress.unwrap_or(0.0);
+                pb.set_message(format!("Seedr cloud caching: {} ({pct:.1}%)", torrent.name));
+                continue;
+            }
+
+            if let Some(folder) = list.folders.iter().find(|f| !previous_folders.contains(&f.id)) {
+                pb.finish_with_message(format!("{} Seedr cloud caching complete!", "✔".green().bold()));
                 return Ok(Some(folder.clone()));
             }
 
-            if let Some(torrent) = list.torrents.iter().find(|t| t.id == torrent_id) {
-                let pct = torrent.progress.unwrap_or(0.0);
-                pb.set_message(format!("Seedr cloud caching: {name} ({pct:.1}%)"));
-            } else {
-                // Torrent disappeared from downloading list, check folders again
+            if let Some(ref target_name) = resolved_name {
                 if let Some(folder) = list
                     .folders
                     .iter()
-                    .find(|f| f.name.contains(name) || name.contains(&f.name))
+                    .find(|f| f.name == *target_name || f.name.contains(target_name) || target_name.contains(&f.name))
                 {
-                    pb.finish_with_message(format!(
-                        "{} Seedr cloud caching complete!",
-                        "✔".green().bold()
-                    ));
+                    pb.finish_with_message(format!("{} Seedr cloud caching complete!", "✔".green().bold()));
                     return Ok(Some(folder.clone()));
                 }
-                pb.finish_with_message(format!("{} Ready in Seedr cloud.", "✔".green().bold()));
-                return Ok(None);
             }
+
+            pb.finish_with_message(format!("{} Ready in Seedr cloud.", "✔".green().bold()));
+            return Ok(list.folders.into_iter().next());
         }
     }
 
+
+
+    /// Lists the root contents (folders and active torrents) in Seedr cloud.
+    ///
+    /// # Errors
+    /// Returns an error if the network request or response parsing fails.
     pub async fn list_root(&self) -> Result<ListContentsResponse> {
         let url = format!(
             "{SEEDR_RESOURCE_URL}?func=list_contents&access_token={}",
@@ -226,6 +265,10 @@ impl SeedrClient {
         Ok(data)
     }
 
+    /// Lists the files inside a specific Seedr cloud folder.
+    ///
+    /// # Errors
+    /// Returns an error if the folder contents cannot be retrieved.
     pub async fn list_folder(&self, folder_id: u64) -> Result<ListContentsResponse> {
         let url = format!(
             "https://www.seedr.cc/api/folder/{folder_id}?access_token={}",
@@ -236,6 +279,10 @@ impl SeedrClient {
         Ok(data)
     }
 
+    /// Retrieves the direct HTTP download URL for a file in Seedr cloud.
+    ///
+    /// # Errors
+    /// Returns an error if URL retrieval fails.
     pub async fn get_download_url(&self, file_id: u64) -> Result<String> {
         let file_str = file_id.to_string();
         let params = [
@@ -253,16 +300,28 @@ impl SeedrClient {
         res.url.context("Download URL not found in Seedr response")
     }
 
+    /// Deletes a folder by ID from the Seedr cloud.
+    ///
+    /// # Errors
+    /// Returns an error if the deletion request fails.
     pub async fn delete_folder(&self, folder_id: u64) -> Result<()> {
         let delete_arr = format!("[{{\"type\":\"folder\",\"id\":{folder_id}}}]");
         self.post_delete(&delete_arr).await
     }
 
+    /// Deletes or cancels an active torrent by ID from the Seedr cloud.
+    ///
+    /// # Errors
+    /// Returns an error if the cancellation request fails.
     pub async fn delete_torrent(&self, torrent_id: u64) -> Result<()> {
         let delete_arr = format!("[{{\"type\":\"torrent\",\"id\":{torrent_id}}}]");
         self.post_delete(&delete_arr).await
     }
 
+    /// Deletes all specified folders from the Seedr cloud.
+    ///
+    /// # Errors
+    /// Returns an error if batch deletion fails.
     pub async fn delete_all_folders(&self, folders: &[SeedrFolder]) -> Result<()> {
         if folders.is_empty() {
             return Ok(());
@@ -286,6 +345,45 @@ impl SeedrClient {
             .form(&params)
             .send()
             .await?;
+        Ok(())
+    }
+}
+
+fn decode_pct(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extracts the display name (`dn=`) parameter from a magnet link if present.
+#[must_use]
+pub fn extract_magnet_name(magnet_or_url: &str) -> Option<String> {
+    let sub = &magnet_or_url[magnet_or_url.find("dn=")? + 3..];
+    let end = sub.find('&').unwrap_or(sub.len());
+    Some(decode_pct(&sub[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_seedr_not_enough_space_response() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{"result":false,"reason_phrase":"not_enough_space_added_to_wishlist"}"#;
+        let res: GenericResponse = serde_json::from_str(json)?;
+        assert!(res.reason_phrase.is_some_and(|r| r.contains("not_enough_space")));
         Ok(())
     }
 }

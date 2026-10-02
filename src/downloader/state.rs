@@ -19,6 +19,12 @@ impl ChunkRange {
         self.end.saturating_sub(self.start) + 1
     }
 
+    /// Whether this chunk range contains zero bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Whether this chunk has finished downloading all assigned bytes.
     #[must_use]
     pub fn is_complete(&self) -> bool {
@@ -78,6 +84,9 @@ impl DownloadState {
     }
 
     /// Loads existing state or creates and persists a new one.
+    ///
+    /// # Errors
+    /// Returns an error if state creation or initial disk write fails.
     pub async fn load_or_init(
         target_dir: &Path,
         file_name: &str,
@@ -104,6 +113,9 @@ impl DownloadState {
     }
 
     /// Serializes and writes state to disk.
+    ///
+    /// # Errors
+    /// Returns an error if serialization or filesystem write fails.
     pub async fn save(&self, target_dir: &Path, file_name: &str) -> Result<()> {
         let path = Self::state_path(target_dir, file_name);
         let content = serde_json::to_string(self).context("Failed to serialize download state")?;

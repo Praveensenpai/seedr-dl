@@ -19,6 +19,7 @@ pub struct CoordinatorConfig {
 }
 
 /// Spawns the background progress and state saving coordinator task.
+#[must_use]
 pub fn spawn_coordinator(cfg: CoordinatorConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(400));
