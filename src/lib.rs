@@ -13,7 +13,10 @@ pub use notifier::{EventCallback, NotificationEvent, Notifier, NotifierConfig};
 pub use seedr::{
     extract_magnet_name, ListContentsResponse, SeedrClient, SeedrFile, SeedrFolder, SeedrTorrent,
 };
-pub use transfer::{download_folder as transfer_download_folder, TransferOptions};
+pub use transfer::{
+    collect_folder_files, download_folder as transfer_download_folder, resolve_destination,
+    CloudFileItem, TransferOptions,
+};
 
 use anyhow::{bail, Result};
 use std::path::PathBuf;

@@ -96,11 +96,13 @@ CLI / Rust App
   pub fn extract_magnet_name(magnet_or_url: &str) -> Option<String>
   ```
 
-### `src/transfer.rs` (Role: direct file download pipeline, Lines: ~165)
-- **Responsibility**: Streams cloud files to local destination directory with progress reporting, without AI or media reorganization.
-- **Types**: `TransferOptions`.
+### `src/transfer.rs` (Role: direct file download pipeline & series resolver, Lines: ~315)
+- **Responsibility**: Recursively scans cloud folders and subfolders, preserves series directory hierarchy, streams cloud files to local destination directory with cumulative progress reporting.
+- **Types**: `CloudFileItem`, `TransferOptions`, `ItemDownloadCtx`.
 - **Public Functions**:
   ```rust
+  pub async fn collect_folder_files(client: &SeedrClient, folder_id: u64) -> Result<Vec<CloudFileItem>>
+  pub fn resolve_destination(output_dir: &Path, folder_name: &str, item: &CloudFileItem, is_multi_file: bool) -> PathBuf
   pub async fn download_folder(client: &SeedrClient, cfg: &Config, folder: &SeedrFolder, opts: &TransferOptions<'_>) -> Result<Vec<PathBuf>>
   ```
 
@@ -121,10 +123,12 @@ CLI / Rust App
 - **Types**: `HistoryEntry` (`id`, `original_name`, `file_path`, `file_size`, `downloaded_at`).
 - **Functions**: `load_history()`, `save_history()`, `add_history_entry()`, `clear_history()`.
 
-### `src/worker.rs` (Role: background task runner, Lines: ~253)
+### `src/worker.rs` (Role: background multi-file series runner, Lines: ~318)
+- **Responsibility**: Manages background downloading of entire series/folders recursively with cumulative progress reporting to tasks and webhooks.
 - **Types**: `WorkerSpawnOpts`.
 - **Functions**: `spawn_worker(opts: &WorkerSpawnOpts)`, `run_worker(folder_id: u64, callback_url: Option<String>, output_dir: Option<PathBuf>)`.
 
 ### `src/task.rs` (Role: background task state persistence, Lines: ~123)
 - **Types**: `TaskState`, `TaskStatus`.
 - **Functions**: `save_task()`, `load_task()`, `remove_task()`, `list_active_tasks()`, `cancel_task()`.
+

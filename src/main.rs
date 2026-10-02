@@ -223,8 +223,8 @@ impl DownloadCtx<'_> {
                 .iter()
                 .find(|f| f.id == folder_id)
                 .map(|f| f.name.clone());
-            let contents = self.client.list_folder(folder_id).await?;
-            let total_size = contents.files.iter().map(|f| f.size).sum::<u64>();
+            let items = seedr_dl::collect_folder_files(self.client, folder_id).await?;
+            let total_size = items.iter().map(|f| f.file.size).sum::<u64>();
             let folder = SeedrFolder {
                 id: folder_id,
                 name: existing_name.unwrap_or_else(|| format!("folder-{folder_id}")),
