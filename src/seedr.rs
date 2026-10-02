@@ -29,6 +29,8 @@ pub struct SeedrTorrent {
     pub download_rate: Option<u64>,
     #[serde(default)]
     pub seeders: Option<u32>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 /// Completed cloud folder stored in Seedr account.
@@ -229,7 +231,9 @@ impl SeedrClient {
                         f.name == *target || f.name.contains(target) || target.contains(&f.name)
                     })
             };
-            if let Some(folder) = list.folders.iter().find(|f| is_match(f)) {
+            let candidates: Vec<&SeedrFolder> =
+                list.folders.iter().filter(|f| is_match(f)).collect();
+            if let Some(folder) = candidates.into_iter().max_by_key(|f| f.size) {
                 pb.finish_with_message(format!(
                     "{} Seedr cloud caching complete!",
                     "✔".green().bold()
@@ -244,7 +248,7 @@ impl SeedrClient {
             }
 
             pb.finish_with_message(format!("{} Ready in Seedr cloud.", "✔".green().bold()));
-            return Ok(list.folders.into_iter().next());
+            return Ok(list.folders.into_iter().max_by_key(|f| f.size));
         }
     }
 
@@ -380,17 +384,15 @@ pub fn extract_magnet_name(magnet_or_url: &str) -> Option<String> {
     Some(decode_pct(&sub[..end]))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_seedr_not_enough_space_response() -> Result<(), Box<dyn std::error::Error>> {
-        let json = r#"{"result":false,"reason_phrase":"not_enough_space_added_to_wishlist"}"#;
-        let res: GenericResponse = serde_json::from_str(json)?;
-        assert!(res
-            .reason_phrase
-            .is_some_and(|r| r.contains("not_enough_space")));
-        Ok(())
-    }
+/// Extracts the BTIH hash from a magnet link if present.
+#[must_use]
+pub fn extract_btih_hash(magnet: &str) -> Option<String> {
+    let prefix = "xt=urn:btih:";
+    let idx = magnet.find(prefix)?;
+    let sub = &magnet[idx + prefix.len()..];
+    let end = sub.find('&').unwrap_or(sub.len());
+    Some(sub[..end].to_lowercase())
 }
+
+#[cfg(test)]
+mod tests;

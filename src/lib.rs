@@ -11,8 +11,8 @@ pub use config::{interactive_auth, load_auth, load_config, save_auth, save_confi
 pub use downloader::Downloader;
 pub use notifier::{EventCallback, NotificationEvent, Notifier, NotifierConfig};
 pub use seedr::{
-    extract_magnet_name, CachingQuery, ListContentsResponse, SeedrClient, SeedrFile, SeedrFolder,
-    SeedrTorrent,
+    extract_btih_hash, extract_magnet_name, CachingQuery, ListContentsResponse, SeedrClient,
+    SeedrFile, SeedrFolder, SeedrTorrent,
 };
 pub use transfer::{
     collect_folder_files, download_folder as transfer_download_folder, resolve_destination,

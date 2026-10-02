@@ -245,45 +245,49 @@ impl DownloadCtx<'_> {
         let root_before = self.client.list_root().await?;
         let prev_ids: Vec<u64> = root_before.folders.iter().map(|f| f.id).collect();
         let name_hint = seedr_dl::extract_magnet_name(target);
-        let existing = name_hint.as_ref().and_then(|name| {
-            root_before
-                .folders
-                .iter()
-                .find(|f| f.name == *name)
-                .cloned()
+        let hash_hint = seedr_dl::extract_btih_hash(target);
+
+        let active_torrent = root_before.torrents.iter().find(|t| {
+            hash_hint.as_ref().is_some_and(|h| {
+                t.hash
+                    .as_deref()
+                    .is_some_and(|th| th.eq_ignore_ascii_case(h))
+            }) || name_hint
+                .as_ref()
+                .is_some_and(|n| t.name.contains(n) || n.contains(&t.name))
         });
 
-        let folder = if let Some(f) = existing {
-            f
+        let (torrent_id, display_name) = if let Some(t) = active_torrent {
+            let name = name_hint.unwrap_or_else(|| t.name.clone());
+            (t.id, name)
         } else {
-            if !root_before.folders.is_empty() {
-                let _ = self.client.delete_all_folders(&root_before.folders).await;
-            }
-            for t in &root_before.torrents {
-                let _ = self.client.delete_torrent(t.id).await;
-            }
-            let torrent_id = self.client.add_magnet(target).await?;
-            let display_name = name_hint
-                .clone()
-                .unwrap_or_else(|| format!("torrent-{torrent_id}"));
-            task::register_caching_task(torrent_id, &display_name);
-
-            let mut on_progress = |t: &SeedrTorrent| {
-                task::update_caching_progress(torrent_id, t);
-            };
-
-            let query = CachingQuery {
-                torrent_id,
-                name: name_hint.as_deref(),
-                previous_folders: &prev_ids,
-            };
-            let folder_res = self
-                .client
-                .wait_for_caching(&query, Some(&mut on_progress))
-                .await;
-            task::remove_task(torrent_id);
-            folder_res?.context("Could not find completed folder in Seedr cloud")?
+            let id = self.client.add_magnet(target).await?;
+            let name = name_hint.unwrap_or_else(|| format!("torrent-{id}"));
+            (id, name)
         };
+
+        task::register_caching_task(torrent_id, &display_name);
+        let mut on_progress = |t: &SeedrTorrent| {
+            task::update_caching_progress(torrent_id, t);
+        };
+
+        let query = CachingQuery {
+            torrent_id,
+            name: Some(&display_name),
+            previous_folders: &prev_ids,
+        };
+        let folder_res = self
+            .client
+            .wait_for_caching(&query, Some(&mut on_progress))
+            .await;
+        task::remove_task(torrent_id);
+        let folder = folder_res?.context("Could not find completed folder in Seedr cloud")?;
+
+        for old in &root_before.folders {
+            if old.id != folder.id && old.name == folder.name && old.size < folder.size {
+                let _ = self.client.delete_folder(old.id).await;
+            }
+        }
 
         self.dispatch(&folder, bg).await
     }

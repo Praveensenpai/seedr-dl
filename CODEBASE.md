@@ -29,7 +29,7 @@ CLI / Rust App
 
 ## 3. Module & Interface Skeleton
 
-### `src/lib.rs` (Role: library root / public API, Lines: ~135)
+### `src/lib.rs` (Role: library root / public API, Lines: ~149)
 - **Responsibility**: Crate entrypoint exporting public library API for other Rust applications.
 - **Imports**: `anyhow::Result`, `std::path::PathBuf`, submodules `config`, `downloader`, `history`, `notifier`, `seedr`, `transfer`.
 - **Types & Enums**:
@@ -47,10 +47,12 @@ CLI / Rust App
   ```rust
   pub async fn download_magnet(client: &SeedrClient, cfg: &Config, magnet: &str, opts: &DownloadOptions) -> Result<Vec<PathBuf>>
   pub async fn download_folder(client: &SeedrClient, cfg: &Config, folder: &SeedrFolder, opts: &DownloadOptions) -> Result<Vec<PathBuf>>
+  pub fn extract_btih_hash(magnet: &str) -> Option<String>
+  pub fn extract_magnet_name(magnet_or_url: &str) -> Option<String>
   ```
 - **Consumers**: External Rust applications, `src/main.rs`.
 
-### `src/main.rs` (Role: CLI entrypoint, Lines: ~390)
+### `src/main.rs` (Role: CLI entrypoint, Lines: ~389)
 - **Responsibility**: Command-line interface for human users and subprocess execution by external tools.
 - **Subcommands**: `download`, `list`, `delete`, `clean`, `tasks`, `cancel`, `auth`, `config`, `history`, `worker` (hidden).
 - **Global Options**: `-o, --output <DIR>`, `--callback-url <URL>`, `--json`, `-y/--yes`, `--keep`.
@@ -79,8 +81,8 @@ CLI / Rust App
   ```
 - **Side Effects / I/O**: Non-blocking tokio mpsc channel, HTTP POST to webhook URLs with rate-limiting.
 
-### `src/seedr.rs` (Role: Seedr API adapter, Lines: ~396)
-- **Responsibility**: Authenticates with Seedr.cc, manages cloud folders/torrents, adaptive polling, and fetches download URLs.
+### `src/seedr.rs` (Role: Seedr API adapter, Lines: ~398 + tests.rs ~38)
+- **Responsibility**: Authenticates with Seedr.cc, manages cloud folders/torrents, adaptive polling, candidate folder selection by largest size, and fetches download URLs.
 - **Types**: `SeedrTorrent`, `SeedrFolder`, `SeedrFile`, `CachingQuery`, `ListContentsResponse`, `SeedrClient`.
 - **Public Functions**:
   ```rust
@@ -93,6 +95,7 @@ CLI / Rust App
   pub async fn delete_folder(&self, folder_id: u64) -> Result<()>
   pub async fn delete_torrent(&self, torrent_id: u64) -> Result<()>
   pub async fn delete_all_folders(&self, folders: &[SeedrFolder]) -> Result<()>
+  pub fn extract_btih_hash(magnet: &str) -> Option<String>
   pub fn extract_magnet_name(magnet_or_url: &str) -> Option<String>
   ```
 
