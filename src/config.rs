@@ -9,17 +9,30 @@ fn default_download_threads() -> usize {
     2
 }
 
+fn default_download_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let default_dir = Path::new(&home).join("Downloads");
+    if default_dir.exists() {
+        default_dir
+    } else {
+        PathBuf::from(".")
+    }
+}
+
 /// Application settings stored in ~/.config/seedr-dl/config.json
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Directory where downloaded files are saved.
+    #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
     /// Whether to delete cloud files after downloading.
+    #[serde(default)]
     pub delete_after_download: bool,
     /// Number of concurrent download worker threads.
     #[serde(default = "default_download_threads")]
     pub download_threads: usize,
 }
+
 
 impl Default for Config {
     fn default() -> Self {
@@ -77,8 +90,8 @@ pub fn load_config() -> Result<Config> {
     }
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-    let config: Config =
-        serde_json::from_str(&content).with_context(|| "Failed to parse config.json")?;
+    let config: Config = serde_json::from_str(&content).unwrap_or_default();
+
     Ok(config)
 }
 
