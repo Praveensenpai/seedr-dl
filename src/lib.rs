@@ -4,12 +4,14 @@ pub mod config;
 pub mod downloader;
 pub mod history;
 pub mod notifier;
+pub mod queue;
 pub mod seedr;
 pub mod transfer;
 
 pub use config::{interactive_auth, load_auth, load_config, save_auth, save_config, Auth, Config};
 pub use downloader::Downloader;
 pub use notifier::{EventCallback, NotificationEvent, Notifier, NotifierConfig};
+pub use queue::{CacheOutcome, CachePolicy, EnsureOpts, Space};
 pub use seedr::{
     extract_btih_hash, extract_magnet_name, CachingQuery, ListContentsResponse, SeedrClient,
     SeedrFile, SeedrFolder, SeedrTorrent,

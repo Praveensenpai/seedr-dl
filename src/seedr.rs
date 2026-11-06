@@ -252,7 +252,7 @@ impl SeedrClient {
         }
     }
 
-    const fn calculate_adaptive_poll_secs(rate: u64) -> u64 {
+    pub(crate) const fn calculate_adaptive_poll_secs(rate: u64) -> u64 {
         match rate {
             0..=149_999 => 60,
             150_000..=499_999 => 30,

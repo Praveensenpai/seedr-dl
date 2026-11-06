@@ -31,7 +31,7 @@ pub async fn download_chunk_with_retry(
     failed_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut attempt = 0;
-    let max_attempts = 5;
+    let max_attempts = 8;
 
     loop {
         if failed_flag.load(Ordering::Relaxed) {
@@ -60,7 +60,7 @@ pub async fn download_chunk_with_retry(
                 }
                 let shift = (attempt - 1).min(5);
                 let backoff_secs = if e.to_string().contains("429") {
-                    2u64.saturating_mul(u64::try_from(attempt).unwrap_or(1))
+                    4u64.saturating_mul(u64::try_from(attempt).unwrap_or(1))
                 } else {
                     1u64 << shift
                 };

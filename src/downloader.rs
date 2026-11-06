@@ -118,8 +118,15 @@ impl Downloader {
             total_size,
         };
 
-        if supports_range && total_size >= 5 * 1024 * 1024 {
-            self.download_parallel(&target, cb).await
+        if self.num_threads > 1 && supports_range && total_size >= 5 * 1024 * 1024 {
+            match self.download_parallel(&target, Arc::clone(&cb)).await {
+                Ok(path) => Ok(path),
+                Err(err) if err.to_string().contains("429") => {
+                    eprintln!("  Rate limit (429) encountered. Falling back to single stream...");
+                    download_single(&self.client, &target, cb).await
+                }
+                Err(err) => Err(err),
+            }
         } else {
             download_single(&self.client, &target, cb).await
         }
