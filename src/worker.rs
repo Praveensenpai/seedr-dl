@@ -119,8 +119,7 @@ async fn resolve_worker_folder_name(
     let existing_task = crate::task::load_task(folder_id);
     let mut name = existing_task
         .as_ref()
-        .map(|t| t.folder_name.clone())
-        .unwrap_or_default();
+        .map_or_default(|t| t.folder_name.clone());
 
     if name.is_empty() || name.starts_with("folder-") {
         if let Ok(root) = client.list_root().await {

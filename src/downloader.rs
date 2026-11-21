@@ -133,32 +133,44 @@ impl Downloader {
     }
 
     async fn probe_download(&self, url: &str) -> Result<(u64, bool)> {
-        let res = self
-            .client
-            .get(url)
-            .header(RANGE, "bytes=0-0")
-            .send()
-            .await
-            .context("Failed to connect to download stream")?;
+        const RETRY_DELAYS: [u64; 3] = [1, 2, 4];
+        let mut last_err = None;
 
-        let status = res.status();
-        if !status.is_success() {
-            anyhow::bail!("Server returned HTTP status: {status}");
+        for attempt in 0..=RETRY_DELAYS.len() {
+            match self.client.get(url).header(RANGE, "bytes=0-0").send().await {
+                Ok(res) => {
+                    let status = res.status();
+                    if !status.is_success() {
+                        anyhow::bail!("Server returned HTTP status: {status}");
+                    }
+                    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                        let total = res
+                            .headers()
+                            .get(reqwest::header::CONTENT_RANGE)
+                            .and_then(|cr| cr.to_str().ok())
+                            .and_then(|s| s.rsplit('/').next())
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(0);
+                        return Ok((total, true));
+                    }
+                    let total = res.content_length().unwrap_or(0);
+                    return Ok((total, false));
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    if let Some(&delay) = RETRY_DELAYS.get(attempt) {
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                    }
+                }
+            }
         }
 
-        if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            let total = res
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|cr| cr.to_str().ok())
-                .and_then(|s| s.rsplit('/').next())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            Ok((total, true))
-        } else {
-            let total = res.content_length().unwrap_or(0);
-            Ok((total, false))
-        }
+        Err(last_err
+            .map_or_else(
+                || anyhow::anyhow!("Unknown error during probe"),
+                |e| anyhow::anyhow!(e),
+            )
+            .context("Failed to connect to download stream"))
     }
 
     async fn prepare_parallel_file(target: &DownloadTarget<'_>) -> Result<()> {
